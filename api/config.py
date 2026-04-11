@@ -54,13 +54,13 @@ class Settings(BaseSettings):
     )
 
     # ── Payments ──────────────────────────────────────────────────────────────
-    STRIPE_SECRET_KEY: str = Field(
-        ...,
-        description="Stripe secret key for payment verification.",
+    STRIPE_SECRET_KEY: Optional[str] = Field(
+        default=None,
+        description="Stripe secret key for payment verification. Optional until payments enabled.",
     )
-    STRIPE_WEBHOOK_SECRET: str = Field(
-        ...,
-        description="Stripe webhook signing secret for event validation.",
+    STRIPE_WEBHOOK_SECRET: Optional[str] = Field(
+        default=None,
+        description="Stripe webhook signing secret. Optional until payments enabled.",
     )
 
     # ── Email Delivery ────────────────────────────────────────────────────────
