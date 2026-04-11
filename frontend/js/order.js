@@ -5,7 +5,7 @@
 
 const API_BASE = window.location.hostname === 'localhost'
   ? 'http://localhost:8000'
-  : 'https://partnerscout-api.up.railway.app'; // update after Railway deploy
+  : 'https://partnerscout-api-production.up.railway.app';
 
 // ── Toast notifications ──────────────────────────────────────────────────────
 

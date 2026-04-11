@@ -5,7 +5,7 @@
 
 const API_BASE = window.location.hostname === 'localhost'
   ? 'http://localhost:8000'
-  : 'https://partnerscout-api.up.railway.app';
+  : 'https://partnerscout-api-production.up.railway.app';
 
 const POLL_INTERVAL_MS = 3000;
 const MAX_POLLS = 120; // 6 minutes max
