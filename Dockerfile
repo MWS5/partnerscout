@@ -6,6 +6,8 @@ ENV MALLOC_ARENA_MAX=2
 
 WORKDIR /app
 
+# CACHEBUST: increment to force fresh pip install after requirements change
+ARG CACHEBUST=2
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
