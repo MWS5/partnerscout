@@ -53,6 +53,12 @@ class Settings(BaseSettings):
         description="Supabase Postgres pooler connection string (pgbouncer).",
     )
 
+    # ── Admin ─────────────────────────────────────────────────────────────────
+    ADMIN_SECRET: Optional[str] = Field(
+        default=None,
+        description="Secret token for owner admin access. Bypasses trial limits and Stripe.",
+    )
+
     # ── Payments ──────────────────────────────────────────────────────────────
     STRIPE_SECRET_KEY: Optional[str] = Field(
         default=None,

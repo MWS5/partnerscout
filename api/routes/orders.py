@@ -120,6 +120,72 @@ async def create_trial_order(
     }
 
 
+# ── POST /api/v1/orders/admin ────────────────────────────────────────────────
+
+@router.post(
+    "/admin",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Admin order — full results, no blur, no Stripe (owner only)",
+)
+async def create_admin_order(
+    payload: OrderCreate,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    config: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    """
+    Create a full admin order for the owner.
+
+    Requires X-Admin-Secret header matching ADMIN_SECRET env var.
+    Returns full unblurred results, no payment required.
+    Count target set to 50 companies for testing.
+
+    Args:
+        payload: Order creation payload.
+        background_tasks: FastAPI background task queue.
+        request: HTTP request.
+        config: Application settings.
+
+    Returns:
+        Dict with order_id, status, and poll_url.
+
+    Raises:
+        HTTPException 403: If admin secret is missing or invalid.
+    """
+    # Verify admin secret
+    admin_secret = request.headers.get("X-Admin-Secret", "")
+    if not config.ADMIN_SECRET or admin_secret != config.ADMIN_SECRET:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid or missing admin secret.",
+        )
+
+    db_pool = _get_db_pool(request)
+
+    order_dict = payload.model_dump()
+    order_dict["is_trial"] = False
+    order_dict["count_target"] = 50  # Full test batch
+
+    order_id = await create_order(db_pool, order_dict)
+    logger.info(f"[ORDERS][create_admin_order] Admin order created: {order_id}")
+
+    background_tasks.add_task(
+        _launch_pipeline,
+        str(order_id),
+        order_dict,
+        db_pool,
+        config,
+        False,  # is_trial=False → full unblurred results
+    )
+
+    return {
+        "order_id": str(order_id),
+        "status": "running",
+        "message": "Admin order started. Full unblurred results, 50 companies.",
+        "poll_url": f"/api/v1/orders/{order_id}",
+    }
+
+
 # ── POST /api/v1/orders ───────────────────────────────────────────────────────
 
 class PaidOrderCreate(OrderCreate):

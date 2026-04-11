@@ -14,8 +14,14 @@ const MAX_POLLS = 120; // 6 minutes max
 let pollCount = 0;
 let pollTimer = null;
 
-const params   = new URLSearchParams(window.location.search);
-const orderId  = params.get('order_id') || localStorage.getItem('ps_trial_order_id');
+const params       = new URLSearchParams(window.location.search);
+const orderId      = params.get('order_id') || localStorage.getItem('ps_trial_order_id');
+const _adminSecret = params.get('admin') || localStorage.getItem('ps_admin_secret') || '';
+const IS_ADMIN     = _adminSecret.length > 0;
+
+if (IS_ADMIN) {
+  document.title = '⚡ PartnerScout — Admin Dashboard';
+}
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const statusTitle    = document.getElementById('statusTitle');
@@ -131,12 +137,12 @@ function renderResults(companies, isTrial) {
 async function showDone(orderId, isTrial) {
   // Update status card
   statusIcon.textContent = '✅';
-  statusTitle.textContent = isTrial
-    ? '10 preview leads ready!'
-    : 'Your leads are ready!';
-  statusSub.textContent = isTrial
-    ? 'Partial contacts shown — upgrade to unlock full data'
-    : 'Download your full database below';
+  statusTitle.textContent = IS_ADMIN
+    ? '⚡ Admin: full results ready!'
+    : isTrial ? '10 preview leads ready!' : 'Your leads are ready!';
+  statusSub.textContent = IS_ADMIN
+    ? 'Full unblurred data — 50 companies'
+    : isTrial ? 'Partial contacts shown — upgrade to unlock full data' : 'Download your full database below';
   statusBadge.textContent = 'Done';
   statusBadge.classList.add('status-badge--done');
   progressFill.style.width = '100%';
@@ -144,11 +150,13 @@ async function showDone(orderId, isTrial) {
 
   // Fetch preview results
   try {
-    const endpoint = isTrial
-      ? `${API_BASE}/api/v1/export/${orderId}/preview`
-      : `${API_BASE}/api/v1/export/${orderId}/json`;
+    // Admin gets full JSON; trial gets blurred preview; paid gets full JSON
+    const endpoint = IS_ADMIN || !isTrial
+      ? `${API_BASE}/api/v1/export/${orderId}/json`
+      : `${API_BASE}/api/v1/export/${orderId}/preview`;
 
-    const resp = await fetch(endpoint);
+    const fetchHeaders = IS_ADMIN ? { 'X-Admin-Secret': _adminSecret } : {};
+    const resp = await fetch(endpoint, { headers: fetchHeaders });
     if (!resp.ok) throw new Error(`Failed to fetch results: ${resp.status}`);
 
     const data = await resp.json();
