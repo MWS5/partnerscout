@@ -11,7 +11,6 @@ import asyncio
 from typing import Any
 from uuid import UUID
 
-import stripe
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from loguru import logger
 
@@ -226,11 +225,18 @@ async def create_paid_order(
     """
     db_pool = _get_db_pool(request)
 
-    # Verify Stripe payment
-    stripe.api_key = config.STRIPE_SECRET_KEY
+    # Verify Stripe payment — lazy import (stripe not installed until payments enabled)
     try:
-        intent = stripe.PaymentIntent.retrieve(payload.stripe_payment_intent_id)
-    except stripe.StripeError as e:
+        import stripe as _stripe  # noqa: PLC0415
+    except ImportError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Payment processing not yet enabled. Contact support.",
+        )
+    _stripe.api_key = config.STRIPE_SECRET_KEY
+    try:
+        intent = _stripe.PaymentIntent.retrieve(payload.stripe_payment_intent_id)
+    except _stripe.StripeError as e:
         logger.error(f"[ORDERS][create_paid_order] Stripe error: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
