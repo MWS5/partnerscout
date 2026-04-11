@@ -164,6 +164,7 @@ async def extract_company_data(
         logger.warning(f"[EXTRACTOR][extract_company_data] No content from Jina for {url}")
         return {
             "website": url,
+            "jina_content": "",
             "address": "Not found",
             "phone": "Not found",
             "email": "Not found",
@@ -180,6 +181,7 @@ async def extract_company_data(
     raw_response = await _call_openrouter(prompt, openrouter_key, model)
     extracted = _parse_extraction_response(raw_response or "")
     extracted["website"] = url
+    extracted["jina_content"] = content  # pass full content for luxury scoring
 
     logger.info(
         f"[EXTRACTOR][extract_company_data] Extracted data for '{company_name}' "

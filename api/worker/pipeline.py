@@ -111,36 +111,46 @@ async def _send_completion_email(
 
 
 async def _run_search_batch(
-    queries: list[str],
+    queries: list[tuple[str, str]],
     config: Settings,
     batch_size: int = 10,
 ) -> list[dict[str, Any]]:
     """
     Run multi-source search in parallel batches.
 
+    FIX (Rule 57-B1): Each query is now a (query_str, niche) tuple so that
+    results are tagged with the correct category from the start.
+
     Args:
-        queries: Full list of search queries.
+        queries: List of (query_string, niche) tuples.
         config: Application settings.
         batch_size: Number of queries to run in parallel per batch.
 
     Returns:
-        Flat list of all search result dicts.
+        Flat list of all search result dicts, each with '_niche' field.
     """
     all_results: list[dict[str, Any]] = []
 
     for i in range(0, len(queries), batch_size):
         batch = queries[i:i + batch_size]
         tasks = []
-        for query in batch:
-            tasks.append(duckduckgo_search(query, num=5))
+        task_niches: list[str] = []
+
+        for query_str, niche in batch:
+            tasks.append(duckduckgo_search(query_str, num=5))
+            task_niches.append(niche)
             if config.BRAVE_API_KEY:
-                tasks.append(brave_search(query, config.BRAVE_API_KEY, num=5))
+                tasks.append(brave_search(query_str, config.BRAVE_API_KEY, num=5))
+                task_niches.append(niche)
             if config.SEARXNG_URL:
-                tasks.append(searxng_search(query, config.SEARXNG_URL, num=5))
+                tasks.append(searxng_search(query_str, config.SEARXNG_URL, num=5))
+                task_niches.append(niche)
 
         batch_results = await asyncio.gather(*tasks, return_exceptions=False)
-        for result_list in batch_results:
+        for result_list, niche in zip(batch_results, task_niches):
             if isinstance(result_list, list):
+                for r in result_list:
+                    r["_niche"] = niche  # tag each result with its source niche
                 all_results.extend(result_list)
 
         logger.debug(
@@ -151,19 +161,23 @@ async def _run_search_batch(
     return all_results
 
 
-def _build_company_from_result(result: dict[str, Any], niche: str) -> dict[str, Any]:
+def _build_company_from_result(result: dict[str, Any], fallback_niche: str) -> dict[str, Any]:
     """
     Convert a ranked search result into a partial company dict.
 
+    FIX (Rule 57-B1): Uses '_niche' tag from result to assign correct category
+    instead of always using niches[0].
+
     Args:
-        result: Ranked search result dict.
-        niche: Source niche category.
+        result: Ranked search result dict (may have '_niche' from search tagging).
+        fallback_niche: Fallback category if '_niche' not present.
 
     Returns:
         Partial company dict ready for extraction enrichment.
     """
+    category = result.get("_niche") or fallback_niche
     return {
-        "category": niche,
+        "category": category,
         "company_name": result.get("title", "Unknown Company"),
         "url": result.get("url", ""),
         "snippet": result.get("snippet", ""),
@@ -218,28 +232,31 @@ async def run_pipeline(
         await update_order_status(db_pool, order_id, "running", PROGRESS_START)
         logger.info(f"[PIPELINE][run_pipeline] Started order={order_id} trial={is_trial}")
 
-        # Step 2: Generate queries
-        queries = generate_queries(niches, regions, segment)
-        await update_order_status(db_pool, order_id, "running", PROGRESS_QUERIES)
-        logger.info(f"[PIPELINE] {len(queries)} queries generated")
+        # Step 2: Generate queries — per niche to preserve category tagging
+        # FIX (Bug 1): generate (query, niche) tuples so each result knows its category
+        tagged_queries: list[tuple[str, str]] = []
+        for niche in (niches or ["general"]):
+            niche_queries = generate_queries([niche], regions, segment)
+            tagged_queries.extend((q, niche) for q in niche_queries)
 
-        # Step 3: Run searches
-        raw_results = await _run_search_batch(queries, config, batch_size=10)
+        await update_order_status(db_pool, order_id, "running", PROGRESS_QUERIES)
+        logger.info(f"[PIPELINE] {len(tagged_queries)} tagged queries generated for niches={niches}")
+
+        # Step 3: Run searches (results carry _niche tag)
+        raw_results = await _run_search_batch(tagged_queries, config, batch_size=10)
         await update_order_status(db_pool, order_id, "running", PROGRESS_SEARCH)
         logger.info(f"[PIPELINE] {len(raw_results)} raw results collected")
 
-        # Step 4: Deduplicate + rank
+        # Step 4: Deduplicate + rank per-niche, preserve category
         unique_results = deduplicate(raw_results)
-        top_query = queries[0] if queries else " ".join(niches)
+        top_query = tagged_queries[0][0] if tagged_queries else " ".join(niches)
         ranked = bm25_rank(top_query, unique_results, top_k=min(200, len(unique_results)))
         await update_order_status(db_pool, order_id, "running", PROGRESS_RANK)
         logger.info(f"[PIPELINE] {len(ranked)} unique results after rank")
 
-        # Build partial company dicts for extraction
-        companies_raw = [
-            _build_company_from_result(r, niches[0] if niches else "general")
-            for r in ranked
-        ]
+        # Build partial company dicts — each carries correct category from _niche tag
+        fallback = niches[0] if niches else "general"
+        companies_raw = [_build_company_from_result(r, fallback) for r in ranked]
 
         # Step 5: Extract contact data from company websites
         limit = 10 if is_trial else min(count_target * 2, len(companies_raw))
@@ -254,9 +271,13 @@ async def run_pipeline(
         logger.info(f"[PIPELINE] {len(enriched)} companies extracted")
 
         # Step 6: Score luxury confidence
+        # FIX (Bug 2): use jina_content (full website text) for scoring, not just snippet
         scored: list[dict[str, Any]] = []
         for company in enriched:
-            content = company.get("snippet", "") + " " + company.get("address", "")
+            jina_content = company.get("jina_content", "")
+            content = jina_content if jina_content else (
+                company.get("snippet", "") + " " + company.get("address", "")
+            )
             score = await score_luxury(
                 company_name=company.get("company_name", ""),
                 website_content=content,
@@ -273,6 +294,9 @@ async def run_pipeline(
         await update_order_status(db_pool, order_id, "running", PROGRESS_VALIDATE)
         total_found = len(qualified)
         logger.info(f"[PIPELINE] {total_found} qualified after luxury filter")
+
+        # FIX (Bug 3): sort by (category, -luxury_score) so output is grouped by category
+        qualified.sort(key=lambda x: (x.get("category", ""), -float(x.get("luxury_score", 0))))
 
         # Step 8: Apply trial blurring or return full results
         if is_trial:
