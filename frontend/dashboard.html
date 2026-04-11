@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PartnerScout AI — Your Results</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/style.css" />
+  <link rel="stylesheet" href="css/dashboard.css" />
+</head>
+<body>
+
+<nav class="nav">
+  <div class="container nav__inner">
+    <a href="index.html" class="nav__logo">
+      <span class="logo-icon">◈</span>
+      <span class="logo-text">PartnerScout <span class="logo-ai">AI</span></span>
+    </a>
+    <div class="nav__links">
+      <a href="index.html#pricing">Upgrade to full access →</a>
+    </div>
+  </div>
+</nav>
+
+<main class="dashboard">
+  <div class="container">
+
+    <!-- STATUS CARD -->
+    <div class="status-card" id="statusCard">
+      <div class="status-header">
+        <div class="status-icon" id="statusIcon">🔍</div>
+        <div class="status-info">
+          <h1 id="statusTitle">AI is searching...</h1>
+          <p id="statusSub">Your 10 preview leads are being prepared</p>
+        </div>
+        <div class="status-badge" id="statusBadge">
+          <span id="statusText">Running</span>
+        </div>
+      </div>
+
+      <!-- PROGRESS BAR -->
+      <div class="progress-wrap" id="progressWrap">
+        <div class="progress-bar">
+          <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+        </div>
+        <div class="progress-steps">
+          <span id="step1" class="pstep">🔎 Generating queries</span>
+          <span id="step2" class="pstep">📡 Searching sources</span>
+          <span id="step3" class="pstep">🏗️ Extracting data</span>
+          <span id="step4" class="pstep">✅ Validating luxury</span>
+          <span id="step5" class="pstep">📦 Preparing results</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- TRIAL RESULTS (shown when done) -->
+    <div id="resultsSection" style="display:none;">
+
+      <!-- TRIAL BANNER -->
+      <div class="trial-banner" id="trialBanner">
+        <div class="trial-banner__text">
+          <h3>🎯 Preview: 10 verified luxury partners found</h3>
+          <p>Emails and personal contacts are partially hidden. Upgrade to unlock full data for all companies.</p>
+        </div>
+        <a href="index.html#pricing" class="btn btn--primary">Unlock full access →</a>
+      </div>
+
+      <!-- RESULTS TABLE -->
+      <div class="results-table-wrap">
+        <div class="results-table-header">
+          <h2>Your 10 preview leads</h2>
+          <div class="results-table-actions">
+            <span id="resultsCount" class="results-count"></span>
+          </div>
+        </div>
+
+        <div class="results-table" id="resultsTable">
+          <!-- Filled by JS -->
+        </div>
+      </div>
+
+      <!-- UPGRADE CTA -->
+      <div class="upgrade-cta">
+        <div class="upgrade-cta__content">
+          <h2>Ready to unlock the full database?</h2>
+          <p>Get 50–500+ verified luxury partners with complete contact data — emails, phones, and decision-maker names.</p>
+          <div class="upgrade-cta__plans">
+            <div class="upgrade-plan">
+              <div class="upgrade-plan__name">Starter</div>
+              <div class="upgrade-plan__price">€149</div>
+              <div class="upgrade-plan__detail">50 companies · 1 region</div>
+            </div>
+            <div class="upgrade-plan upgrade-plan--featured">
+              <div class="upgrade-plan__badge">Best value</div>
+              <div class="upgrade-plan__name">Business</div>
+              <div class="upgrade-plan__price">€349</div>
+              <div class="upgrade-plan__detail">200 companies · 3 regions</div>
+            </div>
+            <div class="upgrade-plan">
+              <div class="upgrade-plan__name">Pro</div>
+              <div class="upgrade-plan__price">€699</div>
+              <div class="upgrade-plan__detail">500+ companies · unlimited</div>
+            </div>
+          </div>
+          <a href="index.html#pricing" class="btn btn--primary btn--lg">Choose your plan →</a>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- ERROR STATE -->
+    <div id="errorSection" style="display:none;" class="error-card">
+      <div class="error-icon">⚠️</div>
+      <h2>Something went wrong</h2>
+      <p id="errorMsg">The search encountered an error. Please try again.</p>
+      <a href="index.html#trial" class="btn btn--primary">Try again →</a>
+    </div>
+
+  </div>
+</main>
+
+<script src="js/dashboard.js"></script>
+</body>
+</html>
