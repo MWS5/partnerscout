@@ -411,7 +411,8 @@ def _ddg_snippets_sync(query: str, num: int = 5) -> list[str]:
         snippets = []
         with DDGS() as ddgs:
             for r in ddgs.text(query, max_results=num):
-                body = r.get("body", "") or r.get("snippet", "")
+                # Handle both v6 ("body") and v7+ ("snippet") key names
+                body = r.get("body") or r.get("snippet", "")
                 if body:
                     snippets.append(body)
         return snippets

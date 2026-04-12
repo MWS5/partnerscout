@@ -51,15 +51,21 @@ def _ddg_search_sync(query: str, num: int) -> list[SearchResultItem]:
         results: list[SearchResultItem] = []
         with DDGS() as ddgs:
             for r in ddgs.text(query, max_results=num):
+                # duckduckgo-search v6 uses "href"; v7+ uses "url" — handle both
+                url = r.get("href") or r.get("url", "")
+                # v6 uses "body"; some versions use "snippet" — handle both
+                snippet = r.get("body") or r.get("snippet", "")
+                if not url:
+                    continue  # skip results with no URL regardless of version
                 results.append({
                     "title": r.get("title", ""),
-                    "url": r.get("href", ""),
-                    "snippet": r.get("body", ""),
+                    "url": url,
+                    "snippet": snippet,
                     "source": "ddg",
                 })
         return results
     except Exception as e:
-        logger.error(f"[SEARCHER][_ddg_search_sync] DDG error for '{query}': {e}")
+        logger.error(f"[SEARCHER][_ddg_search_sync] DDG error for '{query[:50]}': {e}", exc_info=True)
         return []
 
 
