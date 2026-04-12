@@ -28,6 +28,7 @@ from urllib.parse import urlparse
 import httpx
 from loguru import logger
 
+from api.engine.schema_extractor import extract_schema_contacts
 from api.engine.searcher import jina_read
 
 _CONTACT_EXECUTOR = ThreadPoolExecutor(max_workers=4)
@@ -474,13 +475,15 @@ async def extract_company_data(
     Near-100% rule: if any public source has the contact, it WILL be found.
 
     Tiers (all run in parallel):
-      1. Google Places API → phone + address (most reliable for hotels)
-      2. Hunter.io API     → email by domain (~90% accuracy)
-      3. Official website  → Jina multipage fetch (homepage + contact + about)
-      4. DDG search        → Knowledge Panel snippets (phone, email, address)
-      5. Regex fast-path   → instant extraction from all text
+      0. Schema.org / JSON-LD → structured data self-reported by business (FREE)
+      1. Google Places API    → phone + address (most reliable for hotels)
+      2. Hunter.io API        → email by domain (~90% accuracy)
+      3. Official website     → Jina multipage fetch (homepage + contact + about)
+      4. DDG search           → Knowledge Panel snippets (phone, email, address)
+      5. Regex fast-path      → instant extraction from all text
 
-    Then: single LLM call synthesizes all 4 tiers → JSON.
+    Tier 0 short-circuits: if phone+email+address found in schema → skip LLM entirely.
+    This saves ~$0.005 per company AND improves accuracy (no hallucination risk).
 
     Args:
         url: Official company website URL.
@@ -502,13 +505,17 @@ async def extract_company_data(
     except Exception:
         domain = ""
 
-    # ── Run all tiers in parallel ─────────────────────────────────────────────
+    # ── Tier 0: Schema.org / JSON-LD (FREE — runs first, in parallel with others) ──
+    # Fetches raw HTML and parses structured data self-reported by the business.
+    # If phone + email + address all found here → we skip the LLM call entirely.
     (
+        schema_data,
         places_data,
         hunter_result,
         website_content,
         search_snippets,
     ) = await asyncio.gather(
+        extract_schema_contacts(url, company_name),
         _google_places_contact(company_name, google_places_key),
         _hunter_email_search(domain, hunter_api_key),
         _fetch_website(url),
@@ -517,7 +524,39 @@ async def extract_company_data(
     )
 
     # Unpack Hunter result tuple
-    hunter_email, hunter_ms, hunter_success = hunter_result if isinstance(hunter_result, tuple) else ("", 0, False)
+    hunter_email, hunter_ms, hunter_success = (
+        hunter_result if isinstance(hunter_result, tuple) else ("", 0, False)
+    )
+
+    # ── Schema Tier 0: Check if we have enough from structured data ───────────
+    schema_phone   = schema_data.get("phone", "")   if schema_data else ""
+    schema_email   = schema_data.get("email", "")   if schema_data else ""
+    schema_address = schema_data.get("address", "") if schema_data else ""
+    schema_person  = schema_data.get("contact_person", "") if schema_data else ""
+
+    # Short-circuit: if schema has phone + email + address → skip LLM entirely
+    # Use Places phone/email as supplement if schema is partial
+    effective_phone   = schema_phone   or (places_data.get("phone", "")   if places_data else "")
+    effective_email   = schema_email   or hunter_email
+    effective_address = schema_address or (places_data.get("address", "") if places_data else "")
+
+    if effective_phone and effective_email and effective_address:
+        logger.info(
+            f"[EXTRACTOR] '{company_name}' → SHORT-CIRCUIT: "
+            f"schema+tier1 provided all fields — LLM skipped ✓"
+        )
+        extracted = {
+            "phone":          effective_phone,
+            "email":          effective_email,
+            "address":        effective_address,
+            "contact_person": schema_person or "Not found",
+            "personal_phone": "Not found",
+            "personal_email": schema_data.get("personal_email", "Not found") if schema_data else "Not found",
+        }
+        extracted["website"]      = url
+        extracted["jina_content"] = website_content
+        return {**extracted, "company_name": company_name}
+    # Otherwise: continue to full LLM extraction with all tiers as context
 
     # ── Log API costs to JARVIS cost tracker (fire-and-forget) ───────────────
     if db_pool:
@@ -532,6 +571,10 @@ async def extract_company_data(
             logger.debug(f"[EXTRACTOR] Cost logging skipped: {_log_e}")
 
     # ── Combine all text for regex fast-path ──────────────────────────────────
+    schema_text = (
+        f"Phone: {schema_phone}\nEmail: {schema_email}\nAddress: {schema_address}"
+        if (schema_phone or schema_email or schema_address) else ""
+    )
     places_text = (
         f"Phone: {places_data.get('phone', '')}\n"
         f"Address: {places_data.get('address', '')}\n"
@@ -539,7 +582,7 @@ async def extract_company_data(
         if places_data else ""
     )
     hunter_text = f"Email: {hunter_email}" if hunter_email else ""
-    all_text = f"{snippet}\n{places_text}\n{hunter_text}\n{website_content}\n{search_snippets}"
+    all_text = f"{snippet}\n{schema_text}\n{places_text}\n{hunter_text}\n{website_content}\n{search_snippets}"
 
     # ── Tier 5: Regex fast-path ───────────────────────────────────────────────
     regex_emails = _extract_emails(all_text)
@@ -566,17 +609,46 @@ async def extract_company_data(
     )
 
     # ── LLM extraction ────────────────────────────────────────────────────────
-    prompt = EXTRACTION_PROMPT.format(
-        company_name=company_name,
-        url=url or "unknown",
-        places_data=places_formatted,
-        hunter_data=hunter_formatted,
-        website_content=website_content[:2500] if website_content else "(not accessible)",
-        search_snippets=search_snippets[:2000] if search_snippets else "(no search data)",
+    schema_formatted = (
+        f"Phone: {schema_phone or 'Not found'}\n"
+        f"Email: {schema_email or 'Not found'}\n"
+        f"Address: {schema_address or 'Not found'}\n"
+        f"Contact person: {schema_person or 'Not found'}"
+        if (schema_phone or schema_email or schema_address)
+        else "(No Schema.org structured data found on this website)"
     )
+
+    # Build prompt with Tier 0 prepended
+    full_prompt = (
+        f"=== TIER 0 — SCHEMA.ORG STRUCTURED DATA (self-reported by business) ===\n"
+        f"{schema_formatted}\n\n"
+        + EXTRACTION_PROMPT.format(
+            company_name=company_name,
+            url=url or "unknown",
+            places_data=places_formatted,
+            hunter_data=hunter_formatted,
+            website_content=website_content[:2500] if website_content else "(not accessible)",
+            search_snippets=search_snippets[:2000] if search_snippets else "(no search data)",
+        )
+    )
+    prompt = full_prompt
 
     raw = await _call_llm(prompt, openrouter_key, model)
     extracted = _parse_json(raw or "")
+
+    # ── Safety net: inject Tier 0 (Schema.org) if LLM missed ────────────────
+    if schema_phone and extracted["phone"] == "Not found":
+        extracted["phone"] = schema_phone
+        logger.info(f"[EXTRACTOR] Schema.org injected phone for '{company_name}'")
+    if schema_email and extracted["email"] == "Not found":
+        extracted["email"] = schema_email
+        logger.info(f"[EXTRACTOR] Schema.org injected email for '{company_name}'")
+    if schema_address and extracted["address"] == "Not found":
+        extracted["address"] = schema_address
+        logger.info(f"[EXTRACTOR] Schema.org injected address for '{company_name}'")
+    if schema_person and extracted["contact_person"] == "Not found":
+        extracted["contact_person"] = schema_person
+        logger.info(f"[EXTRACTOR] Schema.org injected contact_person for '{company_name}'")
 
     # ── Safety net: inject Tier 1 results if LLM missed them ─────────────────
     if places_data.get("phone") and extracted["phone"] == "Not found":
