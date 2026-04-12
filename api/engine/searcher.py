@@ -43,7 +43,10 @@ def _ddg_search_sync(query: str, num: int) -> list[SearchResultItem]:
         List of unified result dicts.
     """
     try:
-        from ddgs import DDGS
+        try:
+            from duckduckgo_search import DDGS  # duckduckgo-search package
+        except ImportError:
+            from ddgs import DDGS  # fallback: alternate package name
 
         results: list[SearchResultItem] = []
         with DDGS() as ddgs:

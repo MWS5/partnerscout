@@ -26,7 +26,8 @@ from api.db.client import (
     save_results,
     update_order_status,
 )
-from api.engine.exporter import blur_for_trial
+# Note: blur_for_trial is intentionally NOT imported here.
+# Blurring happens only at serve time in export.py / orders.py routes.
 from api.engine.extractor import extract_batch
 from api.engine.query_matrix import generate_queries
 from api.engine.ranker import (
@@ -484,9 +485,13 @@ async def run_pipeline(
             key=lambda x: (x.get("category", ""), -float(x.get("luxury_score", 0)))
         )
 
-        # ── Step 13: Trial blurring or full results ───────────────────────────
+        # ── Step 13: Select companies to save ────────────────────────────────
+        # IMPORTANT: Always save RAW (unblurred) data to DB.
+        # Blurring happens at serve time (export.py / orders.py), NOT here.
+        # Saving blurred data would cause double-blurring when export endpoints
+        # call blur_for_trial again on the already-blurred DB records.
         if is_trial:
-            final_companies = blur_for_trial(qualified)
+            final_companies = qualified[:10]   # max 10 for trial, unblurred
         else:
             final_companies = qualified[:count_target]
 
