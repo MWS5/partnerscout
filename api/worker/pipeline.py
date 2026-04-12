@@ -44,6 +44,7 @@ from api.engine.searcher import (
     brave_search,
     duckduckgo_search,
     searxng_search,
+    serper_search,
 )
 from api.engine.validator import filter_by_luxury, score_luxury
 
@@ -194,6 +195,12 @@ async def _run_search_batch(
     Each query is a (query_str, niche) tuple so results are tagged
     with the correct category from the start.
 
+    Source priority:
+      1. Serper.dev (PRIMARY) — reliable from Railway datacenter IPs, $1/1K queries
+      2. Brave Search (SECONDARY) — free 2000/month, good quality
+      3. DuckDuckGo (FALLBACK) — free but may be blocked on cloud IPs
+      4. SearXNG (OPTIONAL) — self-hosted, must be publicly accessible
+
     Queries include site-exclusion suffixes to prevent aggregator
     results at the source level (before filtering).
 
@@ -207,6 +214,17 @@ async def _run_search_batch(
     """
     all_results: list[dict[str, Any]] = []
 
+    # Log which sources are active (helps diagnose 0-result issues)
+    active_sources = []
+    if config.SERPER_API_KEY:
+        active_sources.append("serper")
+    if config.BRAVE_API_KEY:
+        active_sources.append("brave")
+    active_sources.append("ddg")
+    if config.SEARXNG_URL:
+        active_sources.append("searxng")
+    logger.info(f"[PIPELINE][_run_search_batch] Active sources: {active_sources}")
+
     for i in range(0, len(queries), batch_size):
         batch = queries[i:i + batch_size]
         tasks = []
@@ -216,27 +234,43 @@ async def _run_search_batch(
             # Add site exclusions to every query
             q_with_excl = f"{query_str} {_SEARCH_EXCLUSIONS}"
 
-            tasks.append(duckduckgo_search(q_with_excl, num=5))
-            task_niches.append(niche)
+            # PRIMARY: Serper.dev — works reliably from Railway datacenter IPs
+            if config.SERPER_API_KEY:
+                tasks.append(serper_search(q_with_excl, config.SERPER_API_KEY, num=5))
+                task_niches.append(niche)
+
+            # SECONDARY: Brave Search — free quota, good quality
             if config.BRAVE_API_KEY:
                 tasks.append(brave_search(q_with_excl, config.BRAVE_API_KEY, num=5))
                 task_niches.append(niche)
+
+            # FALLBACK: DuckDuckGo — free but blocked on some cloud IPs
+            tasks.append(duckduckgo_search(q_with_excl, num=5))
+            task_niches.append(niche)
+
+            # OPTIONAL: SearXNG — only if publicly accessible URL is set
             if config.SEARXNG_URL:
                 tasks.append(searxng_search(q_with_excl, config.SEARXNG_URL, num=5))
                 task_niches.append(niche)
 
         batch_results = await asyncio.gather(*tasks, return_exceptions=False)
+        batch_count = 0
         for result_list, niche in zip(batch_results, task_niches):
             if isinstance(result_list, list):
                 for r in result_list:
                     r["_niche"] = niche  # tag each result with its source niche
                 all_results.extend(result_list)
+                batch_count += len(result_list)
 
-        logger.debug(
+        logger.info(
             f"[PIPELINE][_run_search_batch] Batch {i // batch_size + 1}: "
-            f"{len(batch)} queries processed"
+            f"{len(batch)} queries → {batch_count} results"
         )
 
+    logger.info(
+        f"[PIPELINE][_run_search_batch] Total raw results: {len(all_results)} "
+        f"from {len(queries)} queries via {active_sources}"
+    )
     return all_results
 
 
