@@ -444,6 +444,7 @@ async def run_pipeline(
             max_concurrent=5,
             google_places_key=google_places_key,
             hunter_api_key=hunter_api_key,
+            db_pool=db_pool,   # for cost logging to jarvis_search_usage
         )
         await update_order_status(db_pool, order_id, "running", PROGRESS_EXTRACT)
         logger.info(f"[PIPELINE] {len(enriched)} companies extracted")

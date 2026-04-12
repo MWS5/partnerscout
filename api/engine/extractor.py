@@ -20,6 +20,7 @@ Optional API keys (configure via env vars):
 import asyncio
 import json
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -200,10 +201,12 @@ async def _google_places_contact(
         google_api_key: Google Places API key.
 
     Returns:
-        Dict with 'phone', 'address', 'website' keys (empty strings if not found).
+        Dict with 'phone', 'address', 'website', '_duration_ms', '_success' keys.
     """
     if not google_api_key:
-        return {"phone": "", "address": "", "website": ""}
+        return {"phone": "", "address": "", "website": "", "_duration_ms": 0, "_success": False}
+
+    _t0 = time.monotonic()
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -221,7 +224,8 @@ async def _google_places_contact(
             candidates = resp.json().get("candidates", [])
             if not candidates:
                 logger.debug(f"[EXTRACTOR][_google_places_contact] No place found for '{company_name}'")
-                return {"phone": "", "address": "", "website": ""}
+                ms = int((time.monotonic() - _t0) * 1000)
+                return {"phone": "", "address": "", "website": "", "_duration_ms": ms, "_success": False}
 
             place_id = candidates[0]["place_id"]
 
@@ -245,16 +249,21 @@ async def _google_places_contact(
             )
             address = result.get("formatted_address", "")
             website = result.get("website", "")
+            ms = int((time.monotonic() - _t0) * 1000)
 
             logger.info(
                 f"[EXTRACTOR][_google_places_contact] '{company_name}' → "
-                f"phone={'OK' if phone else 'MISS'} address={'OK' if address else 'MISS'}"
+                f"phone={'OK' if phone else 'MISS'} address={'OK' if address else 'MISS'} | {ms}ms"
             )
-            return {"phone": phone, "address": address, "website": website}
+            return {
+                "phone": phone, "address": address, "website": website,
+                "_duration_ms": ms, "_success": bool(phone or address),
+            }
 
     except Exception as e:
+        ms = int((time.monotonic() - _t0) * 1000)
         logger.warning(f"[EXTRACTOR][_google_places_contact] Error for '{company_name}': {e}")
-        return {"phone": "", "address": "", "website": ""}
+        return {"phone": "", "address": "", "website": "", "_duration_ms": ms, "_success": False, "_error": str(e)}
 
 
 # ── Tier 2: Hunter.io Email Search ────────────────────────────────────────────
@@ -262,7 +271,7 @@ async def _google_places_contact(
 async def _hunter_email_search(
     domain: str,
     hunter_api_key: str,
-) -> str:
+) -> tuple[str, int, bool]:
     """
     Find official email for a domain via Hunter.io API.
 
@@ -274,10 +283,12 @@ async def _hunter_email_search(
         hunter_api_key: Hunter.io API key.
 
     Returns:
-        Email string, or empty string if not found / no API key.
+        Tuple of (email_str, duration_ms, success_bool).
     """
     if not hunter_api_key or not domain:
-        return ""
+        return ("", 0, False)
+
+    _t0 = time.monotonic()
 
     # Strip www. and path from domain
     clean_domain = domain.lower().replace("www.", "").split("/")[0]
@@ -313,7 +324,8 @@ async def _hunter_email_search(
                 emails = resp2.json().get("data", {}).get("emails", [])
 
             if not emails:
-                return ""
+                ms = int((time.monotonic() - _t0) * 1000)
+                return ("", ms, False)
 
             # Prefer generic/department emails over personal
             PREFERRED_PREFIXES = (
@@ -329,23 +341,21 @@ async def _hunter_email_search(
                 for e in generic:
                     val = e.get("value", "")
                     if val.startswith(prefix + "@"):
-                        logger.info(
-                            f"[EXTRACTOR][_hunter_email_search] '{domain}' → "
-                            f"preferred: {val}"
-                        )
-                        return val
+                        ms = int((time.monotonic() - _t0) * 1000)
+                        logger.info(f"[EXTRACTOR][_hunter_email_search] '{domain}' → preferred: {val} | {ms}ms")
+                        return (val, ms, True)
 
             # Fallback: best generic, then best personal (highest confidence)
             target = generic[0] if generic else (personal[0] if personal else emails[0])
-            email = target.get("value", "")
-            logger.info(
-                f"[EXTRACTOR][_hunter_email_search] '{domain}' → {email}"
-            )
-            return email
+            email_val = target.get("value", "")
+            ms = int((time.monotonic() - _t0) * 1000)
+            logger.info(f"[EXTRACTOR][_hunter_email_search] '{domain}' → {email_val} | {ms}ms")
+            return (email_val, ms, bool(email_val))
 
     except Exception as e:
+        ms = int((time.monotonic() - _t0) * 1000)
         logger.warning(f"[EXTRACTOR][_hunter_email_search] Error for '{domain}': {e}")
-        return ""
+        return ("", ms, False)
 
 
 # ── Tier 3: Official Website (multi-page) ─────────────────────────────────────
@@ -455,6 +465,7 @@ async def extract_company_data(
     snippet: str = "",
     google_places_key: str = "",
     hunter_api_key: str = "",
+    db_pool: Any = None,
 ) -> dict[str, Any]:
     """
     Extract company contacts using 4+1 parallel tiers.
@@ -478,6 +489,7 @@ async def extract_company_data(
         snippet: Search snippet already collected.
         google_places_key: Optional Google Places API key.
         hunter_api_key: Optional Hunter.io API key.
+        db_pool: Optional asyncpg pool for cost logging to jarvis_search_usage.
 
     Returns:
         Dict with all 6 contact fields + website + jina_content.
@@ -492,7 +504,7 @@ async def extract_company_data(
     # ── Run all tiers in parallel ─────────────────────────────────────────────
     (
         places_data,
-        hunter_email,
+        hunter_result,
         website_content,
         search_snippets,
     ) = await asyncio.gather(
@@ -502,6 +514,21 @@ async def extract_company_data(
         _search_contacts(company_name),
         return_exceptions=False,
     )
+
+    # Unpack Hunter result tuple
+    hunter_email, hunter_ms, hunter_success = hunter_result if isinstance(hunter_result, tuple) else ("", 0, False)
+
+    # ── Log API costs to JARVIS cost tracker (fire-and-forget) ───────────────
+    if db_pool:
+        try:
+            from api.utils.api_cost_logger import log_google_places, log_hunter_io
+            places_ms = places_data.get("_duration_ms", 0) if isinstance(places_data, dict) else 0
+            places_ok = places_data.get("_success", False) if isinstance(places_data, dict) else False
+            places_err = places_data.get("_error") if isinstance(places_data, dict) else None
+            asyncio.create_task(log_google_places(db_pool, company_name, places_ok, places_ms, places_err))
+            asyncio.create_task(log_hunter_io(db_pool, domain, hunter_success, hunter_ms))
+        except Exception as _log_e:
+            logger.debug(f"[EXTRACTOR] Cost logging skipped: {_log_e}")
 
     # ── Combine all text for regex fast-path ──────────────────────────────────
     places_text = (
@@ -595,6 +622,7 @@ async def extract_batch(
     max_concurrent: int = 3,
     google_places_key: str = "",
     hunter_api_key: str = "",
+    db_pool: Any = None,
 ) -> list[dict[str, Any]]:
     """
     Batch-extract contacts for multiple companies with concurrency control.
@@ -609,6 +637,7 @@ async def extract_batch(
         max_concurrent: Max simultaneous company extractions (default 3).
         google_places_key: Optional Google Places API key.
         hunter_api_key: Optional Hunter.io API key.
+        db_pool: Optional asyncpg pool for cost logging.
 
     Returns:
         Companies merged with extracted contact data.
@@ -627,6 +656,7 @@ async def extract_batch(
                     snippet=company.get("snippet", ""),
                     google_places_key=google_places_key,
                     hunter_api_key=hunter_api_key,
+                    db_pool=db_pool,
                 ),
             }
 
