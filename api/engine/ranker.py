@@ -61,6 +61,9 @@ AGGREGATOR_DOMAINS: frozenset[str] = frozenset({
     "sawdays.co.uk", "sawdays.com",
     "ilovefrance.com", "holidaycheck.com",
     "hoteliers.com", "hotelier.com",
+    # Government / national tourism sites (articles about hotels, not hotels themselves)
+    "france.fr", "atout-france.fr", "rendezvousenfrance.com",
+    "franceguide.com", "visitfrance.fr",
     # Regional tourism portals
     "explorenicecotedazur.com", "explorefrance.com", "visitmonaco.com",
     "cotedazur-tourisme.com", "nicetourisme.com", "cannes-destination.fr",
@@ -133,6 +136,7 @@ NON_OFFICIAL_TITLE_PATTERNS: list[str] = [
 # An official hotel site has paths like /en/, /rooms/, /restaurant/, /spa/ — not /hotels/.
 
 NON_OFFICIAL_PATH_PATTERNS: tuple[str, ...] = (
+    # Hotel listing pages
     "/hotels/",           # listing: site.com/hotels/grand-hotel-capferrat
     "/hotel/",            # listing: site.com/hotel/le-bristol
     "/places/hotels/",
@@ -142,19 +146,39 @@ NON_OFFICIAL_PATH_PATTERNS: tuple[str, ...] = (
     "/hotel-guide",
     "/hotel-review",
     "/reviews/",
+    "/compare/",
+    "/deals/hotels",
+    "/ranking/",
+    "/les-meilleurs",
+    "/meilleurs-hotels",
+    # Article / news / blog content paths — NOT official business pages
+    "/article/",          # e.g. france.fr/en/article/hotel-...
+    "/articles/",
+    "/news/",
+    "/actualites/",
+    "/actualite/",
+    "/blog/",
+    "/post/",
+    "/posts/",
+    "/editorial/",
+    "/story/",
+    "/stories/",
+    "/report/",
+    "/reports/",
+    "/feature/",
+    "/features/",
+    "/guide/",
+    "/guides/",
+    # Travel guide paths
     "/travel-guide/",
     "/destinations/",
     "/where-to-stay/",
     "/accommodation/",
-    "/compare/",
-    "/deals/hotels",
+    # Directory / listing paths
     "/liste/",
     "/annuaire/",
     "/directory/",
     "/avis/",
-    "/ranking/",
-    "/les-meilleurs",
-    "/meilleurs-hotels",
     "/selection/",         # curated lists
     "/nos-adresses/",      # "our addresses" blog posts
     "/adresses/",
