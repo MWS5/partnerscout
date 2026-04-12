@@ -75,6 +75,25 @@ class Settings(BaseSettings):
         description="Resend API key for transactional emails. Optional.",
     )
 
+    # ── Contact Data APIs (premium enrichment) ───────────────────────────────
+    GOOGLE_PLACES_API_KEY: Optional[str] = Field(
+        default=None,
+        description=(
+            "Google Places API key. Enables Tier 1 contact extraction: "
+            "verified phone numbers and addresses from Google Maps. "
+            "Highly recommended for near-100% phone find rate on hotels. "
+            "Free tier: $200/month credit (~40,000 Place Detail calls)."
+        ),
+    )
+    HUNTER_API_KEY: Optional[str] = Field(
+        default=None,
+        description=(
+            "Hunter.io API key. Enables Tier 2 email extraction: "
+            "domain-based email finder with ~90% accuracy. "
+            "Free tier: 50 searches/month. Paid: from $34/month."
+        ),
+    )
+
     # ── JARVIS Integration ────────────────────────────────────────────────────
     JARVIS_WEBHOOK_URL: Optional[str] = Field(
         default=None,

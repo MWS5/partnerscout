@@ -1,8 +1,9 @@
 """
-PartnerScout Pipeline Orchestrator.
+PartnerScout Pipeline Orchestrator v2.
 
 Coordinates the full lead generation pipeline:
-  query_matrix → search → rank → extract → validate → export
+  query_matrix → search (with exclusions) → filter → dedup → rank →
+  official-url-resolve → name-dedup → extract (4-tier) → validate → export
 
 Each step updates order progress in the database.
 Errors are caught, logged, and surfaced to the order status.
@@ -12,6 +13,7 @@ Usage:
 """
 
 import asyncio
+from difflib import SequenceMatcher
 from typing import Any, Optional
 from uuid import UUID
 
@@ -27,7 +29,16 @@ from api.db.client import (
 from api.engine.exporter import blur_for_trial
 from api.engine.extractor import extract_batch
 from api.engine.query_matrix import generate_queries
-from api.engine.ranker import bm25_rank, clean_company_name, deduplicate, filter_official_sites
+from api.engine.ranker import (
+    AGGREGATOR_DOMAINS,
+    _domain_is_travel_blog,
+    _registered_domain,
+    _title_is_aggregator,
+    bm25_rank,
+    clean_company_name,
+    deduplicate,
+    filter_official_sites,
+)
 from api.engine.searcher import (
     brave_search,
     duckduckgo_search,
@@ -37,14 +48,31 @@ from api.engine.validator import filter_by_luxury, score_luxury
 
 # ── Progress Constants ────────────────────────────────────────────────────────
 
-PROGRESS_START = 0
-PROGRESS_QUERIES = 10
-PROGRESS_SEARCH = 30
-PROGRESS_RANK = 50
-PROGRESS_EXTRACT = 70
+PROGRESS_START    = 0
+PROGRESS_QUERIES  = 10
+PROGRESS_SEARCH   = 30
+PROGRESS_RANK     = 50
+PROGRESS_EXTRACT  = 70
 PROGRESS_VALIDATE = 85
-PROGRESS_EXPORT = 90
-PROGRESS_DONE = 100
+PROGRESS_EXPORT   = 90
+PROGRESS_DONE     = 100
+
+# ── Site exclusion string for DDG/Brave queries ───────────────────────────────
+# Adding -site:X to the query forces search engines to skip these domains.
+# Use sparingly (DDG supports ~5 exclusions per query effectively).
+
+_SEARCH_EXCLUSIONS = (
+    "-site:wikipedia.org "
+    "-site:booking.com "
+    "-site:tripadvisor.com "
+    "-site:hotels.com "
+    "-site:expedia.com "
+    "-site:theluxevoyager.com "
+    "-site:spotlist.fr "
+    "-site:week-ends-de-reve.com "
+    "-site:privateupgrades.com "
+    "-site:relaischateaux.com"
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -110,6 +138,50 @@ async def _send_completion_email(
         logger.error(f"[PIPELINE][_send_completion_email] Email failed: {e}", exc_info=True)
 
 
+async def _find_official_url(company_name: str, config: Settings) -> str:
+    """
+    Search for the company's official website URL.
+
+    Used when the ranked URL is suspicious or empty.
+    Runs a targeted DDG search and returns the first non-aggregator result.
+
+    Args:
+        company_name: Clean company name.
+        config: Application settings.
+
+    Returns:
+        Official URL string, or empty string if not found.
+    """
+    # Try multiple query variants to find official domain
+    queries = [
+        f'"{company_name}" site officiel',
+        f'"{company_name}" official website',
+        f'{company_name} hotel réservations',
+    ]
+    for query in queries:
+        try:
+            results = await duckduckgo_search(query, num=5)
+            for r in results:
+                url = r.get("url", "")
+                title = r.get("title", "")
+                if not url:
+                    continue
+                domain = _registered_domain(url)
+                if (
+                    domain not in AGGREGATOR_DOMAINS
+                    and not _domain_is_travel_blog(url)
+                    and not _title_is_aggregator(title)
+                ):
+                    logger.info(
+                        f"[PIPELINE][_find_official_url] '{company_name}' → {url}"
+                    )
+                    return url
+        except Exception as e:
+            logger.warning(f"[PIPELINE][_find_official_url] Error: {e}")
+            continue
+    return ""
+
+
 async def _run_search_batch(
     queries: list[tuple[str, str]],
     config: Settings,
@@ -118,8 +190,11 @@ async def _run_search_batch(
     """
     Run multi-source search in parallel batches.
 
-    FIX (Rule 57-B1): Each query is now a (query_str, niche) tuple so that
-    results are tagged with the correct category from the start.
+    Each query is a (query_str, niche) tuple so results are tagged
+    with the correct category from the start.
+
+    Queries include site-exclusion suffixes to prevent aggregator
+    results at the source level (before filtering).
 
     Args:
         queries: List of (query_string, niche) tuples.
@@ -137,13 +212,16 @@ async def _run_search_batch(
         task_niches: list[str] = []
 
         for query_str, niche in batch:
-            tasks.append(duckduckgo_search(query_str, num=5))
+            # Add site exclusions to every query
+            q_with_excl = f"{query_str} {_SEARCH_EXCLUSIONS}"
+
+            tasks.append(duckduckgo_search(q_with_excl, num=5))
             task_niches.append(niche)
             if config.BRAVE_API_KEY:
-                tasks.append(brave_search(query_str, config.BRAVE_API_KEY, num=5))
+                tasks.append(brave_search(q_with_excl, config.BRAVE_API_KEY, num=5))
                 task_niches.append(niche)
             if config.SEARXNG_URL:
-                tasks.append(searxng_search(query_str, config.SEARXNG_URL, num=5))
+                tasks.append(searxng_search(q_with_excl, config.SEARXNG_URL, num=5))
                 task_niches.append(niche)
 
         batch_results = await asyncio.gather(*tasks, return_exceptions=False)
@@ -161,12 +239,65 @@ async def _run_search_batch(
     return all_results
 
 
+def _deduplicate_by_name(
+    companies: list[dict[str, Any]],
+    threshold: float = 0.80,
+) -> list[dict[str, Any]]:
+    """
+    Deduplicate companies by name similarity.
+
+    When two entries have >80% similar names → they are the same company
+    from different sources. Keep the entry with a shorter URL (more likely
+    the official homepage, not a listing page).
+
+    Args:
+        companies: List of company dicts with 'company_name' and 'url'.
+        threshold: Similarity threshold (0.0–1.0). Default 0.80.
+
+    Returns:
+        Deduplicated list.
+    """
+    unique: list[dict[str, Any]] = []
+
+    for company in companies:
+        name = company.get("company_name", "").lower().strip()
+        is_duplicate = False
+
+        for existing in unique:
+            existing_name = existing.get("company_name", "").lower().strip()
+            similarity = SequenceMatcher(None, name, existing_name).ratio()
+
+            if similarity >= threshold:
+                is_duplicate = True
+                # If current entry has a shorter URL, it's more likely official
+                url_current  = company.get("url", "")
+                url_existing = existing.get("url", "")
+                if url_current and len(url_current) < len(url_existing or "https://x"):
+                    # Replace existing with better URL, keep best other fields
+                    existing.update({
+                        k: v for k, v in company.items()
+                        if v and v != "Not found"
+                    })
+                break
+
+        if not is_duplicate:
+            unique.append(company)
+
+    removed = len(companies) - len(unique)
+    if removed:
+        logger.info(
+            f"[PIPELINE][_deduplicate_by_name] {len(companies)} → {len(unique)} "
+            f"(removed {removed} name-duplicates)"
+        )
+    return unique
+
+
 def _build_company_from_result(result: dict[str, Any], fallback_niche: str) -> dict[str, Any]:
     """
     Convert a ranked search result into a partial company dict.
 
     Uses '_niche' tag for correct category assignment.
-    Cleans company name by stripping platform suffixes (Wikipedia, CVB, etc.)
+    Cleans company name by stripping platform suffixes.
 
     Args:
         result: Ranked search result dict (must be official site, not aggregator).
@@ -179,7 +310,7 @@ def _build_company_from_result(result: dict[str, Any], fallback_niche: str) -> d
     raw_title = result.get("title", "Unknown Company")
     return {
         "category":     category,
-        "company_name": clean_company_name(raw_title),  # strip " - Wikipedia" etc.
+        "company_name": clean_company_name(raw_title),
         "url":          result.get("url", ""),
         "snippet":      result.get("snippet", ""),
         "bm25_score":   result.get("bm25_score", 0.0),
@@ -200,17 +331,22 @@ async def run_pipeline(
 
     Steps:
       1.  Update order → running (0%)
-      2.  Generate search queries
+      2.  Generate search queries (per niche, with site exclusions)
       3.  Run multi-source search in batches (DDG + Brave + SearXNG)
-      4.  Deduplicate + BM25 rank results
-      5.  Extract company data per URL (Jina + LLM)
-      6.  Score luxury confidence (Haiku)
-      7.  Filter by luxury score ≥ 0.6
-      8.  Apply trial blurring or full enrichment
-      9.  Save results to ps_results table
-      10. Update order → done, set result_url
-      11. Send completion email (if RESEND_API_KEY configured)
-      12. Notify JARVIS webhook (if JARVIS_WEBHOOK_URL configured)
+      4.  Filter official sites (4-layer defense)
+      5.  Deduplicate by URL + domain
+      6.  BM25 rank results
+      7.  Build company list, resolve missing official URLs
+      8.  Deduplicate by company name similarity
+      9.  Extract contacts — 4-tier parallel (Google Places, Hunter, Jina, DDG)
+      10. Score luxury confidence (Haiku)
+      11. Filter by luxury score ≥ 0.6
+      12. Sort by (category, -luxury_score)
+      13. Apply trial blurring or full results
+      14. Save results to DB
+      15. Mark order done
+      16. Send completion email
+      17. Notify JARVIS webhook
 
     Args:
         order_id: Order UUID string.
@@ -222,63 +358,97 @@ async def run_pipeline(
     Returns:
         Dict with 'companies', 'total_found', 'status' keys.
     """
-    niches = order_data.get("niches", [])
-    regions = order_data.get("regions", [])
-    segment = order_data.get("segment", "luxury")
+    niches       = order_data.get("niches", [])
+    regions      = order_data.get("regions", [])
+    segment      = order_data.get("segment", "luxury")
     count_target = order_data.get("count_target", 100)
-    email = order_data.get("email", "")
+    email        = order_data.get("email", "")
+
+    # Optional premium API keys (graceful degradation if not set)
+    google_places_key = getattr(config, "GOOGLE_PLACES_API_KEY", "") or ""
+    hunter_api_key    = getattr(config, "HUNTER_API_KEY", "") or ""
 
     try:
-        # Step 1: Mark as running
+        # ── Step 1: Mark as running ───────────────────────────────────────────
         await update_order_status(db_pool, order_id, "running", PROGRESS_START)
-        logger.info(f"[PIPELINE][run_pipeline] Started order={order_id} trial={is_trial}")
+        logger.info(
+            f"[PIPELINE][run_pipeline] Started order={order_id} trial={is_trial} "
+            f"google_places={'✓' if google_places_key else '✗'} "
+            f"hunter={'✓' if hunter_api_key else '✗'}"
+        )
 
-        # Step 2: Generate queries — per niche to preserve category tagging
-        # FIX (Bug 1): generate (query, niche) tuples so each result knows its category
+        # ── Step 2: Generate tagged queries ──────────────────────────────────
         tagged_queries: list[tuple[str, str]] = []
         for niche in (niches or ["general"]):
             niche_queries = generate_queries([niche], regions, segment)
             tagged_queries.extend((q, niche) for q in niche_queries)
 
         await update_order_status(db_pool, order_id, "running", PROGRESS_QUERIES)
-        logger.info(f"[PIPELINE] {len(tagged_queries)} tagged queries generated for niches={niches}")
+        logger.info(
+            f"[PIPELINE] {len(tagged_queries)} tagged queries for niches={niches}"
+        )
 
-        # Step 3: Run searches (results carry _niche tag)
+        # ── Step 3: Search (with site exclusions embedded in queries) ─────────
         raw_results = await _run_search_batch(tagged_queries, config, batch_size=10)
         await update_order_status(db_pool, order_id, "running", PROGRESS_SEARCH)
         logger.info(f"[PIPELINE] {len(raw_results)} raw results collected")
 
-        # Step 4: Filter official sites → Deduplicate → BM25 rank
-        # RULE: only official hotel/company domains allowed.
-        # Wikipedia, TripAdvisor, Booking, blogs → removed before extraction.
+        # ── Step 4: Filter official sites (4-layer defense) ───────────────────
         official_results = filter_official_sites(raw_results)
-        unique_results   = deduplicate(official_results)
-        top_query        = tagged_queries[0][0] if tagged_queries else " ".join(niches)
-        ranked = bm25_rank(top_query, unique_results, top_k=min(200, len(unique_results)))
+
+        # ── Step 5: Deduplicate by URL + domain ────────────────────────────────
+        unique_results = deduplicate(official_results)
+
+        # ── Step 6: BM25 rank ─────────────────────────────────────────────────
+        top_query = tagged_queries[0][0] if tagged_queries else " ".join(niches)
+        ranked = bm25_rank(
+            top_query, unique_results, top_k=min(200, len(unique_results))
+        )
+
         await update_order_status(db_pool, order_id, "running", PROGRESS_RANK)
         logger.info(
             f"[PIPELINE] {len(raw_results)} raw → {len(official_results)} official "
             f"→ {len(unique_results)} unique → {len(ranked)} ranked"
         )
 
-        # Build partial company dicts — clean names, correct niche categories
+        # ── Step 7: Build company list + resolve empty/suspicious URLs ─────────
         fallback      = niches[0] if niches else "general"
         companies_raw = [_build_company_from_result(r, fallback) for r in ranked]
 
-        # Step 5: Extract contact data from company websites
-        limit = 10 if is_trial else min(count_target * 2, len(companies_raw))
+        # For companies with empty URL, try to find their official website
+        missing_url_companies = [c for c in companies_raw if not c.get("url")]
+        if missing_url_companies:
+            logger.info(
+                f"[PIPELINE] Resolving official URLs for {len(missing_url_companies)} companies"
+            )
+            url_tasks = [
+                _find_official_url(c["company_name"], config)
+                for c in missing_url_companies
+            ]
+            resolved_urls = await asyncio.gather(*url_tasks, return_exceptions=True)
+            for company, resolved_url in zip(missing_url_companies, resolved_urls):
+                if isinstance(resolved_url, str) and resolved_url:
+                    company["url"] = resolved_url
+
+        # ── Step 8: Deduplicate by company name similarity ─────────────────────
+        companies_raw = _deduplicate_by_name(companies_raw, threshold=0.80)
+
+        # ── Step 9: Extract contact data ──────────────────────────────────────
+        limit      = 10 if is_trial else min(count_target * 2, len(companies_raw))
         to_extract = companies_raw[:limit]
+
         enriched = await extract_batch(
             to_extract,
             config.OPENROUTER_API_KEY,
             config.TIER_B_MODEL,
             max_concurrent=5,
+            google_places_key=google_places_key,
+            hunter_api_key=hunter_api_key,
         )
         await update_order_status(db_pool, order_id, "running", PROGRESS_EXTRACT)
         logger.info(f"[PIPELINE] {len(enriched)} companies extracted")
 
-        # Step 6: Score luxury confidence
-        # FIX (Bug 2): use jina_content (full website text) for scoring, not just snippet
+        # ── Step 10: Score luxury confidence ──────────────────────────────────
         scored: list[dict[str, Any]] = []
         for company in enriched:
             jina_content = company.get("jina_content", "")
@@ -293,53 +463,57 @@ async def run_pipeline(
                 model=config.TIER_C_MODEL,
             )
             company["luxury_score"] = score
-            company["verified"] = score >= 0.8
+            company["verified"]     = score >= 0.8
             scored.append(company)
 
-        # Step 7: Filter by luxury score
-        qualified = filter_by_luxury(scored, min_score=0.6)
-        await update_order_status(db_pool, order_id, "running", PROGRESS_VALIDATE)
+        # ── Step 11: Filter by luxury score ───────────────────────────────────
+        qualified   = filter_by_luxury(scored, min_score=0.6)
         total_found = len(qualified)
+        await update_order_status(db_pool, order_id, "running", PROGRESS_VALIDATE)
         logger.info(f"[PIPELINE] {total_found} qualified after luxury filter")
 
-        # FIX (Bug 3): sort by (category, -luxury_score) so output is grouped by category
-        qualified.sort(key=lambda x: (x.get("category", ""), -float(x.get("luxury_score", 0))))
+        # ── Step 12: Sort by (category, -luxury_score) ────────────────────────
+        qualified.sort(
+            key=lambda x: (x.get("category", ""), -float(x.get("luxury_score", 0)))
+        )
 
-        # Step 8: Apply trial blurring or return full results
+        # ── Step 13: Trial blurring or full results ───────────────────────────
         if is_trial:
             final_companies = blur_for_trial(qualified)
         else:
             final_companies = qualified[:count_target]
 
-        # Step 9: Save results to DB
+        # ── Step 14: Save results ─────────────────────────────────────────────
         await save_results(db_pool, order_id, final_companies)
         await update_order_status(db_pool, order_id, "running", PROGRESS_EXPORT)
 
-        # Step 10: Mark order done
+        # ── Step 15: Mark done ────────────────────────────────────────────────
         result_url = f"/api/v1/export/{order_id}/{'preview' if is_trial else 'csv'}"
         await update_order_status(db_pool, order_id, "done", PROGRESS_DONE, result_url)
-        logger.info(f"[PIPELINE] Order {order_id} completed. Companies: {len(final_companies)}")
+        logger.info(
+            f"[PIPELINE] Order {order_id} completed. Companies: {len(final_companies)}"
+        )
 
-        # Step 11: Email notification
+        # ── Step 16: Email notification ───────────────────────────────────────
         if config.RESEND_API_KEY and email:
             await _send_completion_email(
                 config.RESEND_API_KEY, email, order_id,
                 len(final_companies), is_trial,
             )
 
-        # Step 12: JARVIS webhook notification
+        # ── Step 17: JARVIS webhook ───────────────────────────────────────────
         if config.JARVIS_WEBHOOK_URL:
             await _notify_jarvis(config.JARVIS_WEBHOOK_URL, {
-                "event": "partnerscout.order.completed",
-                "order_id": order_id,
-                "is_trial": is_trial,
+                "event":           "partnerscout.order.completed",
+                "order_id":        order_id,
+                "is_trial":        is_trial,
                 "companies_found": len(final_companies),
-                "email": email,
+                "email":           email,
             })
 
         return {
-            "status": "done",
-            "companies": final_companies,
+            "status":      "done",
+            "companies":   final_companies,
             "total_found": total_found,
         }
 

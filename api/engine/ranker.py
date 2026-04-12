@@ -1,10 +1,18 @@
 """
-PartnerScout AI — BM25 Result Ranker + Official Site Filter.
+PartnerScout AI — BM25 Result Ranker + Official Site Filter v2.
 
-Two responsibilities:
-  1. filter_official_sites()  — removes Wikipedia, aggregators, blogs, OTAs
+Three responsibilities:
+  1. filter_official_sites()  — removes Wikipedia, aggregators, blogs, OTAs,
+                                 travel blogs, review sites, luxury-travel curators
   2. bm25_rank()              — ranks remaining official results by relevance
   3. clean_company_name()     — strips platform suffixes from search titles
+  4. deduplicate()            — by URL + domain (1 result per domain)
+
+Detection layers (defense-in-depth):
+  A. Static domain blacklist  — known aggregator domains
+  B. Domain-word patterns     — travel blog domains (theluxevoyager, spotlist, etc.)
+  C. Title keyword patterns   — review/guide language in title
+  D. URL path patterns        — /hotels/, /review/, /best-hotels- etc.
 """
 
 import re
@@ -15,9 +23,8 @@ from loguru import logger
 from rank_bm25 import BM25Okapi
 
 
-# ── Aggregator / Non-Official Domain Blacklist ────────────────────────────────
-# Any URL whose registered domain matches one of these is NOT an official site.
-# Rule: if Google shows it, but it's not the hotel's own domain → discard.
+# ── A: Static Domain Blacklist ────────────────────────────────────────────────
+# Any URL whose registered domain matches → NOT an official site.
 
 AGGREGATOR_DOMAINS: frozenset[str] = frozenset({
     # Encyclopedias
@@ -31,42 +38,126 @@ AGGREGATOR_DOMAINS: frozenset[str] = frozenset({
     "tripadvisor.com", "tripadvisor.fr", "tripadvisor.co.uk",
     "yelp.com", "yelp.fr", "trustpilot.com",
     "thefork.com", "lafourchette.com", "zomato.com",
-    # Travel media / blogs / guides
+    # Travel media / blogs / guides — general
     "lonelyplanet.com", "timeout.com", "timeout.fr",
     "fodors.com", "frommers.com",
     "cntraveler.com", "travelandleisure.com", "cntraveller.com",
     "theguardian.com", "telegraph.co.uk", "independent.co.uk",
     "nytimes.com", "forbes.com", "vogue.com", "architecturaldigest.com",
+    "elledecor.com", "townandcountrymag.com", "robb-report.com",
+    "robbreport.com", "afar.com", "traveler.com", "travel.com",
+    # Luxury travel curators / blogs (known offenders)
+    "theluxevoyager.com", "theluxuryeditor.com", "luxurytraveladvisor.com",
+    "spotlist.fr", "spotlist.com",
+    "luxe.digital", "luxurycolumnist.com",
+    "the-luxury-review.com", "luxury-hotels.com",
+    "hotelsmagazine.com", "boutiquehotels.co.uk",
+    "suitcase.com", "escapism.com", "thisluxurylife.com",
+    "luxuryhotelworld.com", "luxuryhotelbooking.com",
+    "condenastreader.com", "condenast.com",
+    "travelblog.org", "hotelscombined.com",
+    "jetsetter.com", "tablet.com",
+    "secret-escapes.com", "secretescapes.com",
+    "sawdays.co.uk", "sawdays.com",
+    "ilovefrance.com", "holidaycheck.com",
+    "hoteliers.com", "hotelier.com",
     # Regional tourism portals
     "explorenicecotedazur.com", "explorefrance.com", "visitmonaco.com",
     "cotedazur-tourisme.com", "nicetourisme.com", "cannes-destination.fr",
     "monaco-tourisme.com", "saint-tropez-tourisme.fr",
+    "provenceguide.com", "riviera-guide.com",
     # Aggregator / concierge resellers
-    "privateupgrades.com", "tablet.com", "mrandmrssmith.com",
+    "privateupgrades.com", "mrandmrssmith.com",
     "smallluxuryhotels.com", "designhotels.com",
     "week-ends-de-reve.com", "charmeandtradition.com",
-    "relaischateaux.com",  # keep if direct hotel page needed, but it's aggregator
+    "relaischateaux.com",
+    "leading-hotels.com", "leadinghotels.com", "lhw.com",
     # Business directories
     "pagesjaunes.fr", "annuaire.com", "118000.fr", "kompass.com",
     "societe.com", "infogreffe.fr", "sirene.fr",
+    "europages.com", "europages.fr",
     # Social / search
     "facebook.com", "instagram.com", "twitter.com", "x.com",
     "linkedin.com", "youtube.com", "pinterest.com",
     "google.com", "google.fr", "bing.com", "maps.google.com",
+    # Property / apartment rentals
+    "homeaway.com", "housetrip.com", "wimdu.com",
 })
 
-# Title keywords that always indicate non-official pages
+
+# ── B: Travel Blog Domain-Word Patterns ───────────────────────────────────────
+# If the FIRST segment of the domain (e.g. "theluxevoyager" from "theluxevoyager.com")
+# contains any of these words → it is a travel blog / listing site, not an official hotel.
+# These words appear in travel blogger / listing domain names but rarely in hotel names.
+
+TRAVEL_BLOG_DOMAIN_WORDS: tuple[str, ...] = (
+    "voyager", "voyageur", "traveler", "traveller",
+    "travelblog", "travelguide", "travelmagazine",
+    "spotlist", "spot-list",
+    "discover-hotel", "discoverhotels",
+    "hotel-guide", "hotelguide", "hotelreview", "hotel-review",
+    "best-hotel", "besthotels", "tophotels", "top-hotel",
+    "luxury-hotel", "luxuryhotels", "luxehotel",
+    "weekendreve", "week-end-reve", "weekend-",
+    "getaways", "escapades",
+    "hotelrating", "hotelranking",
+    "curated-hotel", "luxury-list",
+)
+
+
+# ── C: Title Keyword Patterns ─────────────────────────────────────────────────
+# Title keywords that always indicate non-official pages.
+
 NON_OFFICIAL_TITLE_PATTERNS: list[str] = [
     "wikipedia", "tripadvisor", "trip advisor", "booking.com",
     "hotels.com", "expedia", "airbnb", "yelp", "trustpilot",
     "thefork", "lafourchette", "lonelyplanet", "timeout",
     "cntraveler", "travelandleisure", "privateupgrades",
     "week-ends de reve", "week-ends-de-reve",
+    "secret escapes", "secretescapes",
     "guide", "annuaire", "répertoire", "directory",
     "avis clients", "review", "comparatif",
+    "best hotels in", "top hotels in", "luxury hotels in",
+    "hotel ranking", "hotel comparison",
+    "les meilleurs hôtels", "meilleurs hotels",
+    "spotlist", "luxevoyager",
 ]
 
-# Title suffixes to strip when extracting company name from search title
+
+# ── D: URL Path Patterns ──────────────────────────────────────────────────────
+# Path segments that indicate this is a listing/review page, not an official hotel site.
+# An official hotel site has paths like /en/, /rooms/, /restaurant/, /spa/ — not /hotels/.
+
+NON_OFFICIAL_PATH_PATTERNS: tuple[str, ...] = (
+    "/hotels/",           # listing: site.com/hotels/grand-hotel-capferrat
+    "/hotel/",            # listing: site.com/hotel/le-bristol
+    "/places/hotels/",
+    "/best-hotels",       # article: site.com/best-hotels-in-nice
+    "/top-hotels",
+    "/luxury-hotels-in",
+    "/hotel-guide",
+    "/hotel-review",
+    "/reviews/",
+    "/travel-guide/",
+    "/destinations/",
+    "/where-to-stay/",
+    "/accommodation/",
+    "/compare/",
+    "/deals/hotels",
+    "/liste/",
+    "/annuaire/",
+    "/directory/",
+    "/avis/",
+    "/ranking/",
+    "/les-meilleurs",
+    "/meilleurs-hotels",
+    "/selection/",         # curated lists
+    "/nos-adresses/",      # "our addresses" blog posts
+    "/adresses/",
+)
+
+
+# ── Title suffixes to strip when extracting company name from search title ─────
 TITLE_STRIP_SUFFIXES: list[str] = [
     " - Wikipedia", " — Wikipedia", " | Wikipedia",
     " | Booking.com", " on Booking.com",
@@ -75,7 +166,7 @@ TITLE_STRIP_SUFFIXES: list[str] = [
     " - Côte d'Azur CVB", " - Nice Côte d'Azur CVB",
     " - Week-ends de Rêve", " - Private Upgrades",
     " with VIP benefits",
-    " | Four Seasons",   # keep company name, strip platform
+    " | Four Seasons",
     " | Marriott",
     " | Hilton",
     " | AccorHotels",
@@ -84,10 +175,14 @@ TITLE_STRIP_SUFFIXES: list[str] = [
     " - Luxury Hotel",
     " • 5 Star Luxury Hotel • Excellence Riviera",
     " - Excellence Riviera",
+    " - The Luxury Voyager",
+    " - Spotlist",
+    " - Secret Escapes",
+    " - Mr & Mrs Smith",
 ]
 
 
-# ── Official Site Filter ──────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _registered_domain(url: str) -> str:
     """
@@ -109,22 +204,68 @@ def _registered_domain(url: str) -> str:
         return ""
 
 
+def _domain_label(url: str) -> str:
+    """
+    Extract the first label of the registered domain (the brand name).
+
+    Examples:
+        "theluxevoyager.com" → "theluxevoyager"
+        "grandhotelcapferrat.fr" → "grandhotelcapferrat"
+    """
+    domain = _registered_domain(url)
+    return domain.split(".")[0] if "." in domain else domain
+
+
 def _title_is_aggregator(title: str) -> bool:
     """Check if title contains non-official site patterns."""
     title_lower = title.lower()
     return any(pat in title_lower for pat in NON_OFFICIAL_TITLE_PATTERNS)
 
 
+def _domain_is_travel_blog(url: str) -> bool:
+    """
+    Detect travel blog / listing domains by word patterns in domain label.
+
+    Examples that match:
+        theluxevoyager.com  → "theluxevoyager" contains "voyager" → True
+        spotlist.fr         → "spotlist" contains "spotlist"      → True
+        fourseasons.com     → "fourseasons" → no match            → False
+    """
+    label = _domain_label(url).lower()
+    return any(word in label for word in TRAVEL_BLOG_DOMAIN_WORDS)
+
+
+def _path_is_listing(url: str) -> bool:
+    """
+    Detect listing/review URL paths.
+
+    Examples:
+        theluxevoyager.com/hotels/grand-hotel  → path contains "/hotels/" → True
+        grandhotel.com/en/rooms               → path safe                  → False
+    """
+    try:
+        path = urlparse(url).path.lower()
+        if len(path) <= 1:  # root URL = likely official homepage
+            return False
+        return any(pat in path for pat in NON_OFFICIAL_PATH_PATTERNS)
+    except Exception:
+        return False
+
+
+# ── Official Site Filter ──────────────────────────────────────────────────────
+
 def filter_official_sites(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     Filter search results to keep only official company websites.
 
-    Removes: Wikipedia, OTAs (Booking/Expedia/Hotels.com),
-    review platforms (TripAdvisor/Yelp), travel media/blogs,
-    business directories, and social media.
+    4-layer defense:
+      A. Static domain blacklist  (50+ aggregator domains)
+      B. Travel blog domain-words (voyager, spotlist, hotelguide, etc.)
+      C. Title keywords           (review, guide, best hotels in, etc.)
+      D. URL path patterns        (/hotels/, /review/, /best-hotels- etc.)
 
-    Rule: if Google shows a hotel phone on a non-hotel page → we skip
-    that page and fetch the hotel's own website instead.
+    Rule: if Google shows a hotel phone on a non-hotel page → skip
+    that page, the official hotel URL will be fetched separately.
 
     Args:
         results: Raw search result dicts with 'url' and 'title'.
@@ -139,24 +280,41 @@ def filter_official_sites(results: list[dict[str, Any]]) -> list[dict[str, Any]]
         url   = r.get("url", "")
         title = r.get("title", "")
 
-        domain = _registered_domain(url)
-
-        if domain in AGGREGATOR_DOMAINS:
-            skipped.append(f"{domain} ({title[:40]})")
+        if not url:
             continue
 
+        domain = _registered_domain(url)
+
+        # Layer A: static blacklist
+        if domain in AGGREGATOR_DOMAINS:
+            skipped.append(f"A:blacklist ({domain})")
+            continue
+
+        # Layer B: travel blog domain words
+        if _domain_is_travel_blog(url):
+            skipped.append(f"B:blog-domain ({domain})")
+            continue
+
+        # Layer C: title patterns
         if _title_is_aggregator(title):
-            skipped.append(f"title-match ({title[:40]})")
+            skipped.append(f"C:title-match ({title[:40]})")
+            continue
+
+        # Layer D: listing URL paths
+        if _path_is_listing(url):
+            skipped.append(f"D:listing-path ({urlparse(url).path[:40]})")
             continue
 
         official.append(r)
 
     if skipped:
         logger.info(
-            f"[RANKER][filter_official_sites] Removed {len(skipped)} aggregators: "
-            f"{skipped[:5]}{'...' if len(skipped) > 5 else ''}"
+            f"[RANKER][filter_official_sites] Removed {len(skipped)} non-official: "
+            f"{skipped[:8]}{'...' if len(skipped) > 8 else ''}"
         )
-    logger.info(f"[RANKER][filter_official_sites] {len(results)} → {len(official)} official sites kept")
+    logger.info(
+        f"[RANKER][filter_official_sites] {len(results)} → {len(official)} official sites kept"
+    )
     return official
 
 
@@ -191,15 +349,26 @@ def clean_company_name(title: str) -> str:
             if idx > 10:  # only strip if company name part is long enough
                 name = name[:idx]
 
-    # Split on | › • — and take first meaningful part (longest to avoid "Book X")
+    # Split on | › • — and take first meaningful part
     parts = re.split(r"\s*[|›•]\s*", name)
-    # Filter parts that look like company names (>5 chars, not generic phrases)
     generic = {"book", "reserve", "find", "search", "compare", "read", "visit"}
-    clean_parts = [p.strip() for p in parts if len(p.strip()) > 5 and p.strip().lower().split()[0] not in generic]
+    clean_parts = [
+        p.strip() for p in parts
+        if len(p.strip()) > 5 and p.strip().lower().split()[0] not in generic
+    ]
     name = clean_parts[0] if clean_parts else parts[0].strip()
 
-    # Remove leading "Book " / "Reserve " / "Find "
-    name = re.sub(r"^(Book|Reserve|Find|Visit|Discover|Welcome to)\s+", "", name, flags=re.IGNORECASE)
+    # Remove leading action verbs
+    name = re.sub(
+        r"^(Book|Reserve|Find|Visit|Discover|Welcome to)\s+",
+        "", name, flags=re.IGNORECASE,
+    )
+
+    # Remove trailing descriptors after dash/colon (e.g. "Hotel Name: 5-Star Palace on the Riviera")
+    # Only strip if the hotel name itself is > 12 chars (avoid stripping short names)
+    colon_match = re.match(r"^(.{12,}?)\s*[:\–—]\s*.{20,}$", name)
+    if colon_match:
+        name = colon_match.group(1).strip()
 
     return name.strip()
 
@@ -208,10 +377,9 @@ def clean_company_name(title: str) -> str:
 
 def deduplicate(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    Remove duplicate results by normalized URL.
+    Remove duplicate results by normalized URL + registered domain.
 
-    Also deduplicates by registered domain — keeps only 1 result per domain
-    to avoid 5 pages from the same site blocking other companies.
+    Keeps only 1 result per domain to avoid 5 pages from same site.
 
     Args:
         results: List of search result dicts with 'url' key.
@@ -230,7 +398,10 @@ def deduplicate(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         try:
             parsed = urlparse(url)
-            normalized = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
+            normalized = (
+                f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+                f"{parsed.path.rstrip('/')}"
+            )
         except Exception:
             normalized = url.lower().rstrip("/")
 
