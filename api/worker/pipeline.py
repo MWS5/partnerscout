@@ -27,7 +27,7 @@ from api.db.client import (
 from api.engine.exporter import blur_for_trial
 from api.engine.extractor import extract_batch
 from api.engine.query_matrix import generate_queries
-from api.engine.ranker import bm25_rank, deduplicate
+from api.engine.ranker import bm25_rank, clean_company_name, deduplicate, filter_official_sites
 from api.engine.searcher import (
     brave_search,
     duckduckgo_search,
@@ -165,23 +165,24 @@ def _build_company_from_result(result: dict[str, Any], fallback_niche: str) -> d
     """
     Convert a ranked search result into a partial company dict.
 
-    FIX (Rule 57-B1): Uses '_niche' tag from result to assign correct category
-    instead of always using niches[0].
+    Uses '_niche' tag for correct category assignment.
+    Cleans company name by stripping platform suffixes (Wikipedia, CVB, etc.)
 
     Args:
-        result: Ranked search result dict (may have '_niche' from search tagging).
+        result: Ranked search result dict (must be official site, not aggregator).
         fallback_niche: Fallback category if '_niche' not present.
 
     Returns:
-        Partial company dict ready for extraction enrichment.
+        Partial company dict with clean name, ready for contact extraction.
     """
     category = result.get("_niche") or fallback_niche
+    raw_title = result.get("title", "Unknown Company")
     return {
-        "category": category,
-        "company_name": result.get("title", "Unknown Company"),
-        "url": result.get("url", ""),
-        "snippet": result.get("snippet", ""),
-        "bm25_score": result.get("bm25_score", 0.0),
+        "category":     category,
+        "company_name": clean_company_name(raw_title),  # strip " - Wikipedia" etc.
+        "url":          result.get("url", ""),
+        "snippet":      result.get("snippet", ""),
+        "bm25_score":   result.get("bm25_score", 0.0),
     }
 
 
@@ -247,15 +248,21 @@ async def run_pipeline(
         await update_order_status(db_pool, order_id, "running", PROGRESS_SEARCH)
         logger.info(f"[PIPELINE] {len(raw_results)} raw results collected")
 
-        # Step 4: Deduplicate + rank per-niche, preserve category
-        unique_results = deduplicate(raw_results)
-        top_query = tagged_queries[0][0] if tagged_queries else " ".join(niches)
+        # Step 4: Filter official sites → Deduplicate → BM25 rank
+        # RULE: only official hotel/company domains allowed.
+        # Wikipedia, TripAdvisor, Booking, blogs → removed before extraction.
+        official_results = filter_official_sites(raw_results)
+        unique_results   = deduplicate(official_results)
+        top_query        = tagged_queries[0][0] if tagged_queries else " ".join(niches)
         ranked = bm25_rank(top_query, unique_results, top_k=min(200, len(unique_results)))
         await update_order_status(db_pool, order_id, "running", PROGRESS_RANK)
-        logger.info(f"[PIPELINE] {len(ranked)} unique results after rank")
+        logger.info(
+            f"[PIPELINE] {len(raw_results)} raw → {len(official_results)} official "
+            f"→ {len(unique_results)} unique → {len(ranked)} ranked"
+        )
 
-        # Build partial company dicts — each carries correct category from _niche tag
-        fallback = niches[0] if niches else "general"
+        # Build partial company dicts — clean names, correct niche categories
+        fallback      = niches[0] if niches else "general"
         companies_raw = [_build_company_from_result(r, fallback) for r in ranked]
 
         # Step 5: Extract contact data from company websites
