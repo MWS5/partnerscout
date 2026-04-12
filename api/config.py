@@ -38,17 +38,23 @@ class Settings(BaseSettings):
     )
 
     # ── Search APIs ───────────────────────────────────────────────────────────
+    TAVILY_API_KEY: Optional[str] = Field(
+        default=None,
+        description=(
+            "Tavily AI search API key. PRIMARY search engine — works reliably from Railway "
+            "datacenter IPs. Free: 1000 searches/month. Designed for AI agents."
+        ),
+    )
     SERPER_API_KEY: Optional[str] = Field(
         default=None,
         description=(
-            "Serper.dev API key. PRIMARY search engine — works reliably from Railway "
-            "datacenter IPs (DDG often blocks cloud IPs). Cost: $1/1000 queries. "
-            "Highly recommended for production use."
+            "Serper.dev API key. SECONDARY search engine — Google results. "
+            "Cost: $1/1000 queries. Free quota: 2500 credits."
         ),
     )
     BRAVE_API_KEY: Optional[str] = Field(
         default=None,
-        description="Brave Search API key. Secondary search — free 2000/month.",
+        description="Brave Search API key. Free 2000/month.",
     )
     SEARXNG_URL: Optional[str] = Field(
         default="",

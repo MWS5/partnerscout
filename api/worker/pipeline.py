@@ -45,6 +45,7 @@ from api.engine.searcher import (
     duckduckgo_search,
     searxng_search,
     serper_search,
+    tavily_search,
 )
 from api.engine.validator import filter_by_luxury, score_luxury
 
@@ -216,6 +217,8 @@ async def _run_search_batch(
 
     # Log which sources are active (helps diagnose 0-result issues)
     active_sources = []
+    if config.TAVILY_API_KEY:
+        active_sources.append("tavily")
     if config.SERPER_API_KEY:
         active_sources.append("serper")
     if config.BRAVE_API_KEY:
@@ -234,12 +237,17 @@ async def _run_search_batch(
             # Add site exclusions to every query
             q_with_excl = f"{query_str} {_SEARCH_EXCLUSIONS}"
 
-            # PRIMARY: Serper.dev — works reliably from Railway datacenter IPs
+            # PRIMARY: Tavily — AI search, works from Railway IPs, 1000 free/month
+            if config.TAVILY_API_KEY:
+                tasks.append(tavily_search(q_with_excl, config.TAVILY_API_KEY, num=5))
+                task_niches.append(niche)
+
+            # SECONDARY: Serper.dev — Google results, works from Railway IPs
             if config.SERPER_API_KEY:
                 tasks.append(serper_search(q_with_excl, config.SERPER_API_KEY, num=5))
                 task_niches.append(niche)
 
-            # SECONDARY: Brave Search — free quota, good quality
+            # TERTIARY: Brave Search — free quota, good quality
             if config.BRAVE_API_KEY:
                 tasks.append(brave_search(q_with_excl, config.BRAVE_API_KEY, num=5))
                 task_niches.append(niche)
