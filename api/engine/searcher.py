@@ -209,6 +209,57 @@ async def searxng_search(
 
 # ── Jina Reader ───────────────────────────────────────────────────────────────
 
+async def tavily_search(query: str, api_key: str, num: int = 5) -> list[SearchResultItem]:
+    """
+    Web search via Tavily AI API.
+
+    Works reliably from Railway datacenter IPs.
+    Free tier: 1000 searches/month. No rate blocking on cloud IPs.
+    Designed for AI agents — returns clean, structured results.
+
+    Args:
+        query: Search query string.
+        api_key: Tavily API key (tvly-...).
+        num: Number of results (default 5, max 10).
+
+    Returns:
+        List of unified result dicts. Empty list on failure.
+    """
+    if not api_key:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                "https://api.tavily.com/search",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "api_key": api_key,
+                    "query": query,
+                    "max_results": min(num, 10),
+                    "search_depth": "basic",
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        results: list[SearchResultItem] = []
+        for r in data.get("results", []):
+            url = r.get("url", "")
+            if not url:
+                continue
+            results.append({
+                "title": r.get("title", ""),
+                "url": url,
+                "snippet": r.get("content", ""),
+                "source": "tavily",
+            })
+        logger.debug(f"[SEARCHER][tavily_search] '{query[:50]}' → {len(results)} results")
+        return results
+    except Exception as e:
+        logger.error(f"[SEARCHER][tavily_search] Error for '{query[:50]}': {e}", exc_info=True)
+        return []
+
+
 async def serper_search(query: str, api_key: str, num: int = 5) -> list[SearchResultItem]:
     """
     Google Search via Serper.dev API.
