@@ -29,7 +29,8 @@ from api.db.client import (
 # Note: blur_for_trial is intentionally NOT imported here.
 # Blurring happens only at serve time in export.py / orders.py routes.
 from api.engine.extractor import extract_batch
-from api.engine.query_matrix import generate_queries
+from api.engine.places_discovery import discover_companies_via_places
+from api.engine.query_matrix import CITIES, generate_queries
 from api.engine.ranker import (
     AGGREGATOR_DOMAINS,
     _domain_is_travel_blog,
@@ -51,14 +52,15 @@ from api.engine.validator import filter_by_luxury, score_luxury
 
 # ── Progress Constants ────────────────────────────────────────────────────────
 
-PROGRESS_START    = 0
-PROGRESS_QUERIES  = 10
-PROGRESS_SEARCH   = 30
-PROGRESS_RANK     = 50
-PROGRESS_EXTRACT  = 70
-PROGRESS_VALIDATE = 85
-PROGRESS_EXPORT   = 90
-PROGRESS_DONE     = 100
+PROGRESS_START     = 0
+PROGRESS_QUERIES   = 5
+PROGRESS_DISCOVERY = 20   # Google Places discovery complete
+PROGRESS_SEARCH    = 35   # Web search complete
+PROGRESS_RANK      = 50
+PROGRESS_EXTRACT   = 70
+PROGRESS_VALIDATE  = 85
+PROGRESS_EXPORT    = 90
+PROGRESS_DONE      = 100
 
 # ── Site exclusion string for DDG/Brave queries ───────────────────────────────
 # Adding -site:X to the query forces search engines to skip these domains.
@@ -431,18 +433,42 @@ async def run_pipeline(
             f"[PIPELINE] {len(tagged_queries)} tagged queries for niches={niches}"
         )
 
-        # ── Step 3: Search (with site exclusions embedded in queries) ─────────
+        # ── Step 2b: Google Places Discovery (PRIMARY — verified official sites) ─
+        # Places Text Search returns ONLY active businesses with official websites.
+        # No articles, no review sites, no aggregators — just real companies.
+        # Results: official URL + phone + address already pre-filled.
+        discovery_cities = regions if regions else CITIES
+        places_companies: list[dict] = []
+
+        if google_places_key:
+            for niche in (niches or []):
+                niche_discovered = await discover_companies_via_places(
+                    niche=niche,
+                    cities=discovery_cities,
+                    api_key=google_places_key,
+                    max_per_city=5,  # 5 per city × 8 cities = up to 40 per niche
+                )
+                places_companies.extend(niche_discovered)
+            logger.info(
+                f"[PIPELINE] Google Places discovery: {len(places_companies)} verified companies "
+                f"(phone+address pre-filled, official websites only)"
+            )
+        else:
+            logger.warning("[PIPELINE] GOOGLE_PLACES_API_KEY not set — Places discovery skipped")
+        await update_order_status(db_pool, order_id, "running", PROGRESS_DISCOVERY)
+
+        # ── Step 3: Web Search (SUPPLEMENT — fills gaps Places misses) ─────────
         raw_results = await _run_search_batch(tagged_queries, config, batch_size=10)
         await update_order_status(db_pool, order_id, "running", PROGRESS_SEARCH)
-        logger.info(f"[PIPELINE] {len(raw_results)} raw results collected")
+        logger.info(f"[PIPELINE] Web search: {len(raw_results)} raw results")
 
-        # ── Step 4: Filter official sites (4-layer defense) ───────────────────
+        # ── Step 4: Filter official sites (4-layer defense on web results) ───────
         official_results = filter_official_sites(raw_results)
 
-        # ── Step 5: Deduplicate by URL + domain ────────────────────────────────
+        # ── Step 5: Deduplicate web results by URL + domain ────────────────────
         unique_results = deduplicate(official_results)
 
-        # ── Step 6: BM25 rank ─────────────────────────────────────────────────
+        # ── Step 6: BM25 rank web results ─────────────────────────────────────
         top_query = tagged_queries[0][0] if tagged_queries else " ".join(niches)
         ranked = bm25_rank(
             top_query, unique_results, top_k=min(200, len(unique_results))
@@ -450,19 +476,19 @@ async def run_pipeline(
 
         await update_order_status(db_pool, order_id, "running", PROGRESS_RANK)
         logger.info(
-            f"[PIPELINE] {len(raw_results)} raw → {len(official_results)} official "
+            f"[PIPELINE] Web search: {len(raw_results)} raw → {len(official_results)} official "
             f"→ {len(unique_results)} unique → {len(ranked)} ranked"
         )
 
-        # ── Step 7: Build company list + resolve empty/suspicious URLs ─────────
+        # ── Step 7: Build company list from web results ────────────────────────
         fallback      = niches[0] if niches else "general"
-        companies_raw = [_build_company_from_result(r, fallback) for r in ranked]
+        web_companies = [_build_company_from_result(r, fallback) for r in ranked]
 
-        # For companies with empty URL, try to find their official website
-        missing_url_companies = [c for c in companies_raw if not c.get("url")]
+        # Resolve missing URLs for web-search companies
+        missing_url_companies = [c for c in web_companies if not c.get("url")]
         if missing_url_companies:
             logger.info(
-                f"[PIPELINE] Resolving official URLs for {len(missing_url_companies)} companies"
+                f"[PIPELINE] Resolving official URLs for {len(missing_url_companies)} web companies"
             )
             url_tasks = [
                 _find_official_url(c["company_name"], config)
@@ -472,6 +498,28 @@ async def run_pipeline(
             for company, resolved_url in zip(missing_url_companies, resolved_urls):
                 if isinstance(resolved_url, str) and resolved_url:
                     company["url"] = resolved_url
+
+        # ── Step 7b: Merge Places + Web results (Places FIRST, no duplicates) ──
+        # Places companies already have verified official sites → go first.
+        # Web companies that share a domain with a Places company → excluded.
+        from urllib.parse import urlparse as _urlparse
+
+        def _domain_of(c: dict) -> str:
+            try:
+                netloc = _urlparse(c.get("url", "")).netloc.lower().replace("www.", "")
+                parts = netloc.split(".")
+                return ".".join(parts[-2:]) if len(parts) >= 2 else netloc
+            except Exception:
+                return ""
+
+        places_domains = {_domain_of(c) for c in places_companies if _domain_of(c)}
+        web_supplement = [c for c in web_companies if _domain_of(c) not in places_domains]
+
+        companies_raw = places_companies + web_supplement
+        logger.info(
+            f"[PIPELINE] Merged: {len(places_companies)} Places + "
+            f"{len(web_supplement)} web supplement = {len(companies_raw)} total"
+        )
 
         # ── Step 8: Deduplicate by company name similarity ─────────────────────
         companies_raw = _deduplicate_by_name(companies_raw, threshold=0.80)
