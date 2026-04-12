@@ -268,112 +268,113 @@ async def discover_companies_via_places(
 
     seen_domains: set[str] = set()
     companies: list[dict[str, Any]] = []
+    seen_lock = asyncio.Lock()
 
-    async with httpx.AsyncClient() as client:
-        for city in cities:
-            city_count = 0
+    min_rating  = config.get("min_rating", 3.5)
+    min_reviews = config.get("min_reviews", 2)
+    place_type  = config.get("type")
 
+    async def _search_one_city(city: str) -> list[dict[str, Any]]:
+        """Run all query templates for one city, return validated companies."""
+        city_results: list[dict[str, Any]] = []
+
+        async with httpx.AsyncClient(timeout=12.0) as client:
             for query_template in config["queries"]:
-                if city_count >= max_per_city:
+                if len(city_results) >= max_per_city:
                     break
 
                 query = query_template.replace("{city}", city)
-                place_type = config.get("type")
 
-                # Step 1: Text Search
+                # Text Search
                 results = await _text_search(client, query, api_key, place_type)
                 if not results:
                     continue
 
-                # Step 2: Fetch details for top results in parallel
-                top_results = results[:10]  # max 10 detail calls per query
+                # Place Details in parallel (max 5 per query for speed)
+                top_results = results[:5]
                 detail_tasks = [
                     _place_details(client, r["place_id"], api_key)
                     for r in top_results
                 ]
-                details_list = await asyncio.gather(*detail_tasks, return_exceptions=False)
+                details_list = await asyncio.gather(*detail_tasks, return_exceptions=True)
 
-                # Step 3: Validate and collect
                 for basic, detail in zip(top_results, details_list):
-                    if city_count >= max_per_city:
+                    if len(city_results) >= max_per_city:
                         break
-                    if not detail:
+                    if not detail or isinstance(detail, Exception):
                         continue
-
-                    # Validation A: Active business only
                     if detail.get("business_status") != "OPERATIONAL":
-                        logger.debug(
-                            f"[PLACES][discover] Skipped (not operational): "
-                            f"{detail.get('name', '?')} — status={detail.get('business_status')}"
-                        )
                         continue
 
-                    # Validation B: Must have official website
                     website = detail.get("website", "").strip()
                     if not website:
                         continue
 
-                    # Validation C: Exclude OTA/aggregator domains
                     domain = _registered_domain(website)
                     if domain in _EXCLUDED_DOMAINS:
                         continue
 
-                    # Validation D: Deduplication by domain
-                    if domain in seen_domains:
-                        continue
+                    # Global dedup check (thread-safe)
+                    async with seen_lock:
+                        if domain in seen_domains:
+                            continue
+                        seen_domains.add(domain)
 
-                    # Validation E: Minimum rating (quality signal)
-                    rating = float(
-                        basic.get("rating") or detail.get("rating") or 0
-                    )
+                    rating  = float(basic.get("rating") or detail.get("rating") or 0)
                     reviews = int(
-                        basic.get("user_ratings_total") or
-                        detail.get("user_ratings_total") or 0
+                        basic.get("user_ratings_total")
+                        or detail.get("user_ratings_total") or 0
                     )
-                    min_rating = config.get("min_rating", 3.5)
-                    min_reviews = config.get("min_reviews", 2)
-
-                    if reviews >= min_reviews and rating > 0 and rating < min_rating:
-                        logger.debug(
-                            f"[PLACES][discover] Skipped (rating {rating:.1f} < {min_rating}): "
-                            f"{detail.get('name')}"
-                        )
+                    if reviews >= min_reviews and 0 < rating < min_rating:
                         continue
-
-                    seen_domains.add(domain)
-                    city_count += 1
 
                     company_name = detail.get("name") or basic.get("name", "Unknown")
-                    phone = detail.get("formatted_phone_number", "Not found")
+                    phone   = detail.get("formatted_phone_number", "Not found")
                     address = detail.get("formatted_address", "Not found")
 
-                    companies.append({
-                        "category":        niche,
-                        "company_name":    company_name,
-                        "url":             website,
-                        "address":         address,
-                        "phone":           phone,
-                        "email":           "Not found",  # Places API has no email field
-                        "contact_person":  "Not found",
-                        "personal_phone":  "Not found",
-                        "personal_email":  "Not found",
-                        "luxury_score":    0.0,           # scored later in pipeline
-                        "verified":        True,          # Google Places = verified
-                        "places_rating":   rating,
+                    city_results.append({
+                        "category":       niche,
+                        "company_name":   company_name,
+                        "url":            website,
+                        "address":        address,
+                        "phone":          phone,
+                        "email":          "Not found",
+                        "contact_person": "Not found",
+                        "personal_phone": "Not found",
+                        "personal_email": "Not found",
+                        "luxury_score":   0.0,
+                        "verified":       True,
+                        "places_rating":  rating,
                         "snippet": (
                             f"Google Places verified {config['label']} in {city}. "
                             f"Rating: {rating:.1f} ({reviews} reviews)."
                         ),
                     })
-
                     logger.info(
-                        f"[PLACES][discover] ✓ {company_name} "
-                        f"({niche}, {city}) → {website} "
-                        f"[rating={rating:.1f}, reviews={reviews}]"
+                        f"[PLACES][discover] ✓ {company_name} ({city}) "
+                        f"→ {website} [rating={rating:.1f}]"
                     )
+
+        return city_results
+
+    # Run ALL cities in parallel (was sequential — caused pipeline hang)
+    try:
+        city_results_list = await asyncio.wait_for(
+            asyncio.gather(*[_search_one_city(city) for city in cities],
+                           return_exceptions=True),
+            timeout=60.0,   # hard cap: discovery must finish in 60s total
+        )
+        for city_results in city_results_list:
+            if isinstance(city_results, list):
+                companies.extend(city_results)
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"[PLACES][discover] niche='{niche}' timed out after 60s — "
+            f"using {len(companies)} companies collected so far"
+        )
 
     logger.info(
         f"[PLACES][discover] niche='{niche}' across {len(cities)} cities → "
-        f"{len(companies)} verified companies discovered"
+        f"{len(companies)} verified companies (parallel fetch)"
     )
     return companies
