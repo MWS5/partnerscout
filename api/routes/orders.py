@@ -8,6 +8,8 @@ Endpoints:
 """
 
 import asyncio
+import uuid
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -18,6 +20,7 @@ from api.config import Settings, get_settings
 from api.db.client import create_order, get_order, get_results
 from api.engine.exporter import blur_for_trial
 from api.models.order import OrderCreate, OrderStatus, OrderStatusEnum
+from api.routes.export import _safe_serialize  # reuse the safe serializer
 from api.worker.pipeline import run_pipeline
 
 router = APIRouter(prefix="/api/v1/orders", tags=["orders"])
@@ -308,20 +311,22 @@ async def get_order_status(
         )
 
     response: dict[str, Any] = {
-        "id": str(order["id"]),
-        "status": order["status"],
-        "progress": order["progress"],
-        "is_trial": order["is_trial"],
+        "id":         str(order["id"]),
+        "status":     order["status"],
+        "progress":   order["progress"],
+        "is_trial":   bool(order["is_trial"]),
         "created_at": order["created_at"].isoformat() if order.get("created_at") else None,
         "result_url": order.get("result_url"),
-        "error_msg": order.get("error_msg"),
+        "error_msg":  order.get("error_msg"),
     }
 
     # Attach results if done
     if order["status"] == "done":
         if order["is_trial"]:
             companies = await get_results(db_pool, str(order_id))
-            response["preview"] = blur_for_trial(companies)
+            blurred = blur_for_trial(companies)
+            # _safe_serialize converts asyncpg UUID/datetime → str to prevent 500 errors
+            response["preview"] = _safe_serialize(blurred)
             response["message"] = (
                 "Unlock full contact details and download all leads at partnerscout.ai"
             )

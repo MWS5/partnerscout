@@ -32,6 +32,7 @@ from loguru import logger
 from api.config import get_settings
 from api.db.client import get_pool
 from api.routes.export import router as export_router
+from api.routes.log import router as log_router
 from api.routes.orders import router as orders_router
 from api.routes.webhook import router as webhook_router
 
@@ -56,6 +57,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # ── Startup ───────────────────────────────────────────────────────────────
     logger.info("[MAIN] PartnerScout AI starting up...")
+
+    # Store config in app state so routes can access it (for webhooks etc.)
+    app.state.config = config
 
     try:
         pool = await get_pool(config.DATABASE_URL)
@@ -110,6 +114,7 @@ def create_app() -> FastAPI:
     # ── Routers ───────────────────────────────────────────────────────────────
     app.include_router(orders_router)
     app.include_router(export_router)
+    app.include_router(log_router)
     app.include_router(webhook_router)
 
     return app

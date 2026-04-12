@@ -1,6 +1,8 @@
 /**
- * PartnerScout AI — Dashboard
- * Polls order status → shows progress → renders results table
+ * PartnerScout AI — Dashboard v3
+ * - Trial: uses preview data from poll response directly (no extra fetch)
+ * - Admin/paid: fetches full JSON from export endpoint
+ * - Auto-reports JS errors to backend for JARVIS logging
  */
 
 const API_BASE = window.location.hostname === 'localhost'
@@ -10,7 +12,6 @@ const API_BASE = window.location.hostname === 'localhost'
 const POLL_INTERVAL_MS = 3000;
 const MAX_POLLS = 250; // ~12.5 minutes max
 
-// ── State ─────────────────────────────────────────────────────────────────────
 let pollCount = 0;
 let pollTimer = null;
 
@@ -36,6 +37,17 @@ const errorMsg       = document.getElementById('errorMsg');
 const resultsTable   = document.getElementById('resultsTable');
 const resultsCount   = document.getElementById('resultsCount');
 const trialBanner    = document.getElementById('trialBanner');
+
+// ── Auto error reporting to JARVIS ────────────────────────────────────────────
+async function reportError(context, message) {
+  try {
+    await fetch(`${API_BASE}/api/v1/log/error`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ context, message, order_id: orderId, ts: new Date().toISOString() }),
+    });
+  } catch (_) { /* non-fatal */ }
+}
 
 // ── Progress step mapping ─────────────────────────────────────────────────────
 const STEPS = [
@@ -85,6 +97,13 @@ function scoreBadge(score) {
 function renderResults(companies, isTrial) {
   if (!resultsTable) return;
 
+  if (!companies || !companies.length) {
+    resultsTable.innerHTML = `<div style="padding:32px;text-align:center;color:var(--text-muted)">
+      No results found for this search. Try different niches or regions.
+    </div>`;
+    return;
+  }
+
   const header = `
     <div class="result-row result-row--header">
       <span>Company</span>
@@ -103,7 +122,7 @@ function renderResults(companies, isTrial) {
       ? `<div class="company-address">${c.address.slice(0, 50)}</div>`
       : '';
 
-    const emailCell = c.email === 'Not found'
+    const emailCell = (!c.email || c.email === 'Not found')
       ? `<span class="locked">Not found</span>`
       : `<span class="email-blurred">${c.email}</span>`;
 
@@ -114,7 +133,7 @@ function renderResults(companies, isTrial) {
     return `
       <div class="result-row">
         <div>
-          <div class="company-name">${c.company_name}</div>
+          <div class="company-name">${c.company_name || '—'}</div>
           ${website}
           ${address}
         </div>
@@ -134,58 +153,90 @@ function renderResults(companies, isTrial) {
 }
 
 // ── Show done state ────────────────────────────────────────────────────────────
-async function showDone(orderId, isTrial) {
+/**
+ * @param {string} orderId
+ * @param {boolean} isTrial
+ * @param {object} pollData - Full response from GET /orders/{id} (already has preview!)
+ */
+async function showDone(orderId, isTrial, pollData) {
   // Update status card
-  statusIcon.textContent = '✅';
-  statusTitle.textContent = IS_ADMIN
+  if (statusIcon)  statusIcon.textContent = '✅';
+  if (statusTitle) statusTitle.textContent = IS_ADMIN
     ? '⚡ Admin: full results ready!'
     : isTrial ? '10 preview leads ready!' : 'Your leads are ready!';
-  statusSub.textContent = IS_ADMIN
+  if (statusSub) statusSub.textContent = IS_ADMIN
     ? 'Full unblurred data — 50 companies'
     : isTrial ? 'Partial contacts shown — upgrade to unlock full data' : 'Download your full database below';
-  statusBadge.textContent = 'Done';
-  statusBadge.classList.add('status-badge--done');
-  progressFill.style.width = '100%';
+  if (statusBadge) {
+    statusBadge.textContent = 'Done';
+    statusBadge.classList.add('status-badge--done');
+  }
+  if (progressFill) progressFill.style.width = '100%';
   updateProgressSteps(100);
 
-  // Fetch preview results
-  try {
-    // Admin gets full JSON; trial gets blurred preview; paid gets full JSON
-    const endpoint = IS_ADMIN || !isTrial
-      ? `${API_BASE}/api/v1/export/${orderId}/json`
-      : `${API_BASE}/api/v1/export/${orderId}/preview`;
+  let companies = [];
 
-    const fetchHeaders = IS_ADMIN ? { 'X-Admin-Secret': _adminSecret } : {};
-    const resp = await fetch(endpoint, { headers: fetchHeaders });
-    if (!resp.ok) throw new Error(`Failed to fetch results: ${resp.status}`);
+  if (IS_ADMIN || !isTrial) {
+    // ── Admin / paid: fetch full JSON export ──────────────────────────────
+    try {
+      const fetchHeaders = IS_ADMIN ? { 'X-Admin-Secret': _adminSecret } : {};
+      const resp = await fetch(`${API_BASE}/api/v1/export/${orderId}/json`, { headers: fetchHeaders });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status} from /json`);
+      const data = await resp.json();
+      companies = Array.isArray(data) ? data : (data.companies || []);
+    } catch (err) {
+      console.error('[DASHBOARD] Full export fetch failed:', err);
+      await reportError('showDone/json', err.message);
+    }
 
-    const data = await resp.json();
-    const companies = Array.isArray(data) ? data : (data.companies || []);
+  } else {
+    // ── Trial: use preview data already in the poll response ──────────────
+    // GET /orders/{id} ALREADY returns response["preview"] for done+trial orders.
+    // No second HTTP request needed — eliminates the extra failure point.
+    companies = Array.isArray(pollData?.preview) ? pollData.preview : [];
 
-    renderResults(companies, isTrial);
+    // Fallback: if poll data somehow missing preview, hit /preview endpoint
+    if (!companies.length) {
+      console.warn('[DASHBOARD] Poll data had no preview — trying /preview endpoint');
+      try {
+        const resp = await fetch(`${API_BASE}/api/v1/export/${orderId}/preview`);
+        if (resp.ok) {
+          const pData = await resp.json();
+          companies = Array.isArray(pData.companies) ? pData.companies : [];
+        } else {
+          const errMsg = `HTTP ${resp.status} from /preview`;
+          console.error('[DASHBOARD] Preview fallback failed:', errMsg);
+          await reportError('showDone/preview_fallback', errMsg);
+        }
+      } catch (fbErr) {
+        console.error('[DASHBOARD] Preview fallback exception:', fbErr);
+        await reportError('showDone/preview_exception', fbErr.message);
+      }
+    }
+  }
 
-    // Show results section
+  // Render whatever we have
+  renderResults(companies, isTrial);
+
+  if (resultsSection) {
     resultsSection.style.display = 'block';
     resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
-
-  } catch (err) {
-    console.error('[DASHBOARD] Failed to load results:', err);
-    // Still show results section but with empty table message
-    resultsTable.innerHTML = `<div style="padding:24px;text-align:center;color:var(--text-muted)">Results are ready — check your email for the download link.</div>`;
-    resultsSection.style.display = 'block';
   }
 }
 
 // ── Show error state ───────────────────────────────────────────────────────────
 function showError(message) {
-  statusIcon.textContent = '❌';
-  statusTitle.textContent = 'Search failed';
-  statusSub.textContent = 'An error occurred during the search';
-  statusBadge.textContent = 'Error';
-  statusBadge.classList.add('status-badge--error');
-  progressWrap.style.display = 'none';
-  if (errorMsg) errorMsg.textContent = message || 'Unknown error occurred.';
+  if (statusIcon)  statusIcon.textContent = '❌';
+  if (statusTitle) statusTitle.textContent = 'Search failed';
+  if (statusSub)   statusSub.textContent = 'An error occurred during the search';
+  if (statusBadge) {
+    statusBadge.textContent = 'Error';
+    statusBadge.classList.add('status-badge--error');
+  }
+  if (progressWrap) progressWrap.style.display = 'none';
+  if (errorMsg)     errorMsg.textContent = message || 'Unknown error occurred.';
   if (errorSection) errorSection.style.display = 'block';
+  reportError('showError', message);
 }
 
 // ── Poll order status ─────────────────────────────────────────────────────────
@@ -206,13 +257,14 @@ async function pollStatus(orderId) {
 
     // Update progress bar
     if (typeof progress === 'number') {
-      progressFill.style.width = `${progress}%`;
+      if (progressFill) progressFill.style.width = `${progress}%`;
       updateProgressSteps(progress);
     }
 
     if (status === 'done') {
       clearInterval(pollTimer);
-      await showDone(orderId, is_trial !== false);
+      // Pass full poll data — it contains data.preview for trial orders!
+      await showDone(orderId, is_trial !== false, data);
     } else if (status === 'failed') {
       clearInterval(pollTimer);
       showError(error_msg || 'Pipeline failed. Please try again.');

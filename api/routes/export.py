@@ -7,6 +7,8 @@ Endpoints:
   GET /api/v1/export/{order_id}/preview — blurred 10-company preview (trial)
 """
 
+import uuid
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -16,6 +18,32 @@ from loguru import logger
 
 from api.db.client import get_order, get_results
 from api.engine.exporter import blur_for_trial, to_csv, to_json
+
+
+def _safe_serialize(obj: Any) -> Any:
+    """
+    Recursively convert asyncpg / non-JSON-serializable types to safe Python types.
+
+    Handles: uuid.UUID → str, datetime → ISO str, dict/list → recurse.
+    This ensures FastAPI can always serialize the response without 500 errors.
+
+    Args:
+        obj: Any Python object from asyncpg Record.
+
+    Returns:
+        JSON-safe Python object.
+    """
+    if isinstance(obj, dict):
+        return {k: _safe_serialize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_safe_serialize(i) for i in obj]
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", errors="replace")
+    return obj
 
 router = APIRouter(prefix="/api/v1/export", tags=["export"])
 
@@ -189,11 +217,15 @@ async def export_preview(order_id: UUID, request: Request) -> dict[str, Any]:
     companies = await get_results(db_pool, str(order_id))
     blurred = blur_for_trial(companies)
 
-    logger.info(f"[EXPORT][export_preview] Serving {len(blurred)} blurred records for order={order_id}")
+    # _safe_serialize converts uuid.UUID / datetime to JSON-safe types
+    # This prevents 500 errors from asyncpg Record values that FastAPI can't serialize
+    safe_blurred = _safe_serialize(blurred)
+
+    logger.info(f"[EXPORT][export_preview] Serving {len(safe_blurred)} blurred records for order={order_id}")
     return {
         "order_id": str(order_id),
-        "is_trial": order.get("is_trial", True),
-        "companies": blurred,
-        "total_in_preview": len(blurred),
+        "is_trial": bool(order.get("is_trial", True)),
+        "companies": safe_blurred,
+        "total_in_preview": len(safe_blurred),
         "unlock_cta": "Get full contact details — upgrade at partnerscout.ai",
     }

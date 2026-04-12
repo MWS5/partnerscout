@@ -205,7 +205,7 @@ async def save_results(
                 "category", "company_name", "website", "url", "address",
                 "phone", "email", "contact_person", "personal_phone",
                 "personal_email", "luxury_score", "verified",
-            }}),
+            }}, default=str),  # default=str handles datetime/UUID/asyncpg types
         )
         for c in companies
     ]
