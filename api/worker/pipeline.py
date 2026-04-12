@@ -544,6 +544,16 @@ async def run_pipeline(
         _score_semaphore = asyncio.Semaphore(8)
 
         async def _score_one(company: dict[str, Any]) -> dict[str, Any]:
+            # Google Places verified companies already have a pre-computed
+            # luxury_score based on their Places rating — skip expensive LLM call.
+            if company.get("places_verified"):
+                logger.debug(
+                    f"[PIPELINE][score] '{company.get('company_name')}' "
+                    f"→ Places pre-scored {company['luxury_score']:.2f} (LLM skipped)"
+                )
+                company["verified"] = company["luxury_score"] >= 0.8
+                return company
+
             jina_content = company.get("jina_content", "")
             content = jina_content if jina_content else (
                 company.get("snippet", "") + " " + company.get("address", "")
