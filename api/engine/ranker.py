@@ -82,6 +82,10 @@ AGGREGATOR_DOMAINS: frozenset[str] = frozenset({
     "google.com", "google.fr", "bing.com", "maps.google.com",
     # Property / apartment rentals
     "homeaway.com", "housetrip.com", "wimdu.com",
+    # Travel blogs / city guides seen in production logs
+    "pierreblake.com", "cityzeum.com", "tourazur.com",
+    "frejus-tourist-office.com", "trip.com",
+    "easyvoyage.com", "routard.com", "leguide.com",
 })
 
 

@@ -220,7 +220,7 @@ def generate_queries(
     niches: list[str],
     regions: list[str],
     segment: SegmentType = "luxury",
-    max_queries: int = 120,
+    max_queries: int = 40,
 ) -> list[str]:
     """
     Generate all search query combinations for given niches and regions.
@@ -235,7 +235,7 @@ def generate_queries(
         niches: List of target niche keys (e.g. ["hotel", "wedding"]).
         regions: List of target city/region names.
         segment: Market segment — affects qualifier injection.
-        max_queries: Hard cap on output size (default 120).
+        max_queries: Hard cap on output size (default 40).
 
     Returns:
         Deduplicated list of search query strings, capped at max_queries.

@@ -449,23 +449,29 @@ async def run_pipeline(
         await update_order_status(db_pool, order_id, "running", PROGRESS_EXTRACT)
         logger.info(f"[PIPELINE] {len(enriched)} companies extracted")
 
-        # ── Step 10: Score luxury confidence ──────────────────────────────────
-        scored: list[dict[str, Any]] = []
-        for company in enriched:
+        # ── Step 10: Score luxury confidence (parallel, max 8 concurrent) ───────
+        _score_semaphore = asyncio.Semaphore(8)
+
+        async def _score_one(company: dict[str, Any]) -> dict[str, Any]:
             jina_content = company.get("jina_content", "")
             content = jina_content if jina_content else (
                 company.get("snippet", "") + " " + company.get("address", "")
             )
-            score = await score_luxury(
-                company_name=company.get("company_name", ""),
-                website_content=content,
-                niche=company.get("category", ""),
-                openrouter_key=config.OPENROUTER_API_KEY,
-                model=config.TIER_C_MODEL,
-            )
+            async with _score_semaphore:
+                score = await score_luxury(
+                    company_name=company.get("company_name", ""),
+                    website_content=content,
+                    niche=company.get("category", ""),
+                    openrouter_key=config.OPENROUTER_API_KEY,
+                    model=config.TIER_C_MODEL,
+                )
             company["luxury_score"] = score
             company["verified"]     = score >= 0.8
-            scored.append(company)
+            return company
+
+        scored: list[dict[str, Any]] = list(
+            await asyncio.gather(*[_score_one(c) for c in enriched])
+        )
 
         # ── Step 11: Filter by luxury score ───────────────────────────────────
         qualified   = filter_by_luxury(scored, min_score=0.6)
