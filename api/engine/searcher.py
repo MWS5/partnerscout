@@ -209,6 +209,55 @@ async def searxng_search(
 
 # ── Jina Reader ───────────────────────────────────────────────────────────────
 
+async def serper_search(query: str, api_key: str, num: int = 5) -> list[SearchResultItem]:
+    """
+    Google Search via Serper.dev API.
+
+    Works reliably from Railway datacenter IPs (unlike DDG which blocks cloud IPs).
+    Cost: $1 per 1,000 requests.
+    Results are Google organic search results.
+
+    Args:
+        query: Search query string.
+        api_key: Serper.dev API key.
+        num: Number of results (default 5, max 10).
+
+    Returns:
+        List of unified result dicts. Empty list on failure.
+    """
+    if not api_key:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                "https://google.serper.dev/search",
+                headers={
+                    "X-API-KEY": api_key,
+                    "Content-Type": "application/json",
+                },
+                json={"q": query, "num": min(num, 10), "gl": "fr", "hl": "fr"},
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        results: list[SearchResultItem] = []
+        for r in data.get("organic", []):
+            url = r.get("link", "")
+            if not url:
+                continue
+            results.append({
+                "title": r.get("title", ""),
+                "url": url,
+                "snippet": r.get("snippet", ""),
+                "source": "serper",
+            })
+        logger.debug(f"[SEARCHER][serper_search] '{query[:50]}' → {len(results)} results")
+        return results
+    except Exception as e:
+        logger.error(f"[SEARCHER][serper_search] Error for '{query[:50]}': {e}", exc_info=True)
+        return []
+
+
 async def jina_read(url: str, max_chars: int = 3000) -> str:
     """
     Extract readable text content from a URL via Jina Reader.

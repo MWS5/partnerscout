@@ -38,13 +38,25 @@ class Settings(BaseSettings):
     )
 
     # ── Search APIs ───────────────────────────────────────────────────────────
+    SERPER_API_KEY: Optional[str] = Field(
+        default=None,
+        description=(
+            "Serper.dev API key. PRIMARY search engine — works reliably from Railway "
+            "datacenter IPs (DDG often blocks cloud IPs). Cost: $1/1000 queries. "
+            "Highly recommended for production use."
+        ),
+    )
     BRAVE_API_KEY: Optional[str] = Field(
         default=None,
-        description="Brave Search API key. Optional — DDG used as fallback.",
+        description="Brave Search API key. Secondary search — free 2000/month.",
     )
     SEARXNG_URL: Optional[str] = Field(
         default="",
-        description="Base URL of self-hosted SearXNG instance. Optional.",
+        description=(
+            "Base URL of self-hosted SearXNG instance. Optional. "
+            "WARNING: must be publicly accessible — Railway internal URLs "
+            "(searxng.railway.internal) only work within the SAME Railway project."
+        ),
     )
 
     # ── Database ──────────────────────────────────────────────────────────────
