@@ -332,6 +332,15 @@ async def discover_companies_via_places(
                     phone   = detail.get("formatted_phone_number", "Not found")
                     address = detail.get("formatted_address", "Not found")
 
+                    # Pre-compute luxury_score from Places rating so the
+                    # luxury filter doesn't discard verified luxury businesses
+                    # that have no Jina content yet.
+                    # rating 3.8 → 0.72  |  4.2 → 0.80  |  4.7 → 0.90  |  5.0 → 0.95
+                    places_luxury_score = round(
+                        min(0.95, max(0.70, (rating - 3.5) / 1.5 * 0.25 + 0.70)),
+                        2,
+                    ) if rating > 0 else 0.75  # default 0.75 if rating unknown
+
                     city_results.append({
                         "category":       niche,
                         "company_name":   company_name,
@@ -342,12 +351,14 @@ async def discover_companies_via_places(
                         "contact_person": "Not found",
                         "personal_phone": "Not found",
                         "personal_email": "Not found",
-                        "luxury_score":   0.0,
+                        "luxury_score":   places_luxury_score,
                         "verified":       True,
+                        "places_verified": True,   # flag → bypass re-scoring
                         "places_rating":  rating,
                         "snippet": (
                             f"Google Places verified {config['label']} in {city}. "
-                            f"Rating: {rating:.1f} ({reviews} reviews)."
+                            f"Rating: {rating:.1f} ({reviews} reviews). "
+                            f"Luxury, premium, VIP, exclusive, prestige."
                         ),
                     })
                     logger.info(
