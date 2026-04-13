@@ -14,14 +14,23 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 
 
 class NicheEnum(str, Enum):
-    """Supported luxury B2B niches for lead generation."""
+    """
+    Active niches for PartnerScout demo.
+
+    Only two niches are exposed for client presentation:
+      - hotel        → 4-5 star hotels & event venues (HOTELS & EVENTS)
+      - event_agency → luxury event and corporate agencies (AGENCIES)
+    """
 
     hotel = "hotel"
     event_agency = "event_agency"
-    wedding = "wedding"
-    concierge = "concierge"
-    travel = "travel"
-    venue = "venue"
+
+
+# Human-readable display labels for niches
+NICHE_LABELS: dict[str, str] = {
+    "hotel":        "Hotels & Events",
+    "event_agency": "Agencies",
+}
 
 
 class SegmentEnum(str, Enum):
@@ -72,10 +81,10 @@ class OrderCreate(BaseModel):
         description="Minimum market segment for filtering.",
     )
     count_target: int = Field(
-        default=100,
+        default=15,
         ge=10,
-        le=500,
-        description="Target number of enriched leads (10–500).",
+        le=20,
+        description="Target number of strictly validated leads (10–20). Demo mode.",
     )
     is_trial: bool = Field(
         default=False,

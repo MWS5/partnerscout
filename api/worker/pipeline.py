@@ -49,6 +49,7 @@ from api.engine.searcher import (
     tavily_search,
 )
 from api.engine.validator import filter_by_luxury, score_luxury
+from api.engine.strict_validator import validate_and_filter
 
 # ── Progress Constants ────────────────────────────────────────────────────────
 
@@ -525,8 +526,10 @@ async def run_pipeline(
         companies_raw = _deduplicate_by_name(companies_raw, threshold=0.80)
 
         # ── Step 9: Extract contact data ──────────────────────────────────────
-        limit      = 10 if is_trial else min(count_target * 2, len(companies_raw))
-        to_extract = companies_raw[:limit]
+        # Extract 3× the target so strict validation has enough candidates to
+        # choose from even after rejecting incomplete/partner contacts.
+        extract_limit = 10 if is_trial else min(count_target * 3, len(companies_raw), 60)
+        to_extract = companies_raw[:extract_limit]
 
         enriched = await extract_batch(
             to_extract,
@@ -539,6 +542,24 @@ async def run_pipeline(
         )
         await update_order_status(db_pool, order_id, "running", PROGRESS_EXTRACT)
         logger.info(f"[PIPELINE] {len(enriched)} companies extracted")
+
+        # ── Step 9b: Strict contact validation ───────────────────────────────
+        # 3-layer gate: rules + source trust + LLM sanity (Haiku, ~$0.0001/co)
+        # Only companies with official URL + official email (domain match) +
+        # valid phone pass. This is the quality gate for the demo.
+        if not is_trial:
+            enriched = await validate_and_filter(
+                enriched,
+                openrouter_key=config.OPENROUTER_API_KEY,
+                tier_c_model=config.TIER_C_MODEL,
+                max_results=count_target,
+                min_results=max(10, count_target // 2),
+            )
+            await update_order_status(db_pool, order_id, "running", PROGRESS_VALIDATE - 5)
+            logger.info(
+                f"[PIPELINE] {len(enriched)} companies after strict validation "
+                f"(target={count_target})"
+            )
 
         # ── Step 10: Score luxury confidence (parallel, max 8 concurrent) ───────
         _score_semaphore = asyncio.Semaphore(8)
@@ -590,10 +611,13 @@ async def run_pipeline(
         # Blurring happens at serve time (export.py / orders.py), NOT here.
         # Saving blurred data would cause double-blurring when export endpoints
         # call blur_for_trial again on the already-blurred DB records.
+        #
+        # Demo mode: strict cap 10-20 strictly validated contacts.
         if is_trial:
             final_companies = qualified[:10]   # max 10 for trial, unblurred
         else:
-            final_companies = qualified[:count_target]
+            # count_target is already capped at 20 by model; respect it.
+            final_companies = qualified[:min(count_target, 20)]
 
         # ── Step 14: Save results ─────────────────────────────────────────────
         await save_results(db_pool, order_id, final_companies)

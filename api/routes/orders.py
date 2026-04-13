@@ -166,7 +166,7 @@ async def create_admin_order(
 
     order_dict = payload.model_dump()
     order_dict["is_trial"] = False
-    order_dict["count_target"] = 50  # Full test batch
+    order_dict["count_target"] = 20  # Demo: 10-20 strictly validated contacts
 
     order_id = await create_order(db_pool, order_dict)
     logger.info(f"[ORDERS][create_admin_order] Admin order created: {order_id}")
@@ -331,9 +331,9 @@ async def get_order_status(
                 "Unlock full contact details and download all leads at partnerscout.ai"
             )
         else:
+            # Demo mode: CSV only (clean, professional, ready for client)
             response["download"] = {
                 "csv": f"/api/v1/export/{order_id}/csv",
-                "json": f"/api/v1/export/{order_id}/json",
             }
 
     return response
