@@ -82,9 +82,9 @@ class OrderCreate(BaseModel):
     )
     count_target: int = Field(
         default=15,
-        ge=10,
-        le=20,
-        description="Target number of strictly validated leads (10–20). Demo mode.",
+        ge=5,
+        le=100,
+        description="Target number of leads (5–100). Demo default: 15.",
     )
     is_trial: bool = Field(
         default=False,

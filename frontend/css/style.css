@@ -312,6 +312,27 @@ a:hover { color: var(--accent2); }
 }
 .checkbox-item input { accent-color: var(--accent); }
 
+/* Disabled niche — coming soon */
+.checkbox-item--disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+  pointer-events: none;
+  border-color: rgba(255,255,255,0.06) !important;
+  background: transparent !important;
+}
+.checkbox-item--disabled input { cursor: not-allowed; }
+.badge-soon {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: rgba(139,92,246,0.18);
+  color: var(--accent);
+  border-radius: 4px;
+  padding: 1px 5px;
+  margin-left: 2px;
+}
+
 .form-note { text-align: center; font-size: 12px; color: var(--text-muted); margin-top: 12px; }
 
 /* PREVIEW BOX */
