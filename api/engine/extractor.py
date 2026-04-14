@@ -459,7 +459,6 @@ async def _fetch_emails_direct(
         return results
 
     # ── Pass 1: Direct HTTP fetch (fast, full HTML) ───────────────────────────
-    direct_success_count = 0
     try:
         async with httpx.AsyncClient(
             timeout=8.0,
@@ -469,12 +468,11 @@ async def _fetch_emails_direct(
             tasks = [client.get(url) for url in contact_pages]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-        for url, resp in zip(contact_pages, responses):
+        for resp in responses:
             if isinstance(resp, Exception):
                 continue
             if not hasattr(resp, "status_code") or resp.status_code != 200:
                 continue
-            direct_success_count += 1
             for email in _extract_from_text(resp.text):
                 if email not in found_emails:
                     found_emails.append(email)
@@ -483,18 +481,23 @@ async def _fetch_emails_direct(
         logger.warning(f"[EXTRACTOR][_fetch_emails_direct] Direct fetch error for {base_url}: {e}")
 
     # ── Pass 2: Jina Reader fallback (bypasses bot-protection, CDN IPs) ───────
-    # Triggered when direct fetch found no pages (bot protection on Railway IPs)
-    # Jina reads through its own infrastructure so hotel websites can't block it.
-    if not found_emails and direct_success_count < 3:
+    # Always runs when direct fetch found no emails.
+    # Luxury hotels soft-redirect ALL paths to 200 → direct_success_count is always high,
+    # but pages return homepage content without actual contact emails.
+    # Jina uses CDN IPs that bypass Cloudflare bot protection.
+    if not found_emails:
         logger.info(
-            f"[EXTRACTOR][_fetch_emails_direct] Direct fetch blocked for '{company_domain}' "
+            f"[EXTRACTOR][_fetch_emails_direct] No emails from direct fetch for '{company_domain}' "
             f"— trying Jina fallback for contact pages"
         )
+        # Jina uses its own CDN IPs — bypasses Cloudflare bot protection that blocks Railway
         jina_contact_pages = [
             f"{base_url.rstrip('/')}/contact",
             f"{base_url.rstrip('/')}/nous-contacter",
+            f"{base_url.rstrip('/')}/contactez-nous",
             f"{base_url.rstrip('/')}/fr/contact",
             f"{base_url.rstrip('/')}/en/contact",
+            f"{base_url.rstrip('/')}/en/contact-us",
         ]
         jina_results = await asyncio.gather(
             *[jina_read(url, max_chars=4000) for url in jina_contact_pages],
@@ -505,6 +508,12 @@ async def _fetch_emails_direct(
                 for email in _extract_from_text(content):
                     if email not in found_emails:
                         found_emails.append(email)
+
+        if found_emails:
+            logger.info(
+                f"[EXTRACTOR][_fetch_emails_direct] Jina fallback found {len(found_emails)} "
+                f"emails for '{company_domain}': {found_emails[:3]}"
+            )
 
     if not found_emails:
         return []
