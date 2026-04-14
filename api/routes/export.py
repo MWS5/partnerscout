@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import Response
 from loguru import logger
 
+from api.config import get_settings
 from api.db.client import get_order, get_results
 from api.engine.exporter import blur_for_trial, to_csv, to_json
 
@@ -65,6 +66,7 @@ async def _get_verified_order(
     db_pool: Any,
     order_id: str,
     require_paid: bool = True,
+    request: Any = None,
 ) -> dict[str, Any]:
     """
     Fetch and validate order for export access.
@@ -73,11 +75,13 @@ async def _get_verified_order(
       - Order exists
       - Order status is 'done'
       - For paid exports: order is not a trial (is_trial=False)
+        EXCEPTION: X-Admin-Secret or X-Demo-Secret bypasses the paid check.
 
     Args:
         db_pool: asyncpg connection pool.
         order_id: Order UUID string.
-        require_paid: If True, rejects trial orders.
+        require_paid: If True, rejects trial orders (unless admin/demo secret present).
+        request: HTTP request for secret header extraction.
 
     Returns:
         Order dict from DB.
@@ -101,10 +105,21 @@ async def _get_verified_order(
         )
 
     if require_paid and order.get("is_trial", False):
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail="Full export requires a paid order. Upgrade at partnerscout.ai",
-        )
+        # Allow bypass with valid admin or demo secret
+        bypassed = False
+        if request is not None:
+            config = get_settings()
+            admin_hdr = request.headers.get("X-Admin-Secret", "")
+            demo_hdr  = request.headers.get("X-Demo-Secret", "")
+            if config.ADMIN_SECRET and admin_hdr == config.ADMIN_SECRET:
+                bypassed = True
+            elif config.DEMO_SECRET and demo_hdr == config.DEMO_SECRET:
+                bypassed = True
+        if not bypassed:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail="Full export requires a paid order. Upgrade at partnerscout.ai",
+            )
 
     return order
 
@@ -130,7 +145,7 @@ async def export_csv(order_id: UUID, request: Request) -> Response:
         CSV file download response.
     """
     db_pool = _get_db_pool(request)
-    await _get_verified_order(db_pool, str(order_id), require_paid=True)
+    await _get_verified_order(db_pool, str(order_id), require_paid=True, request=request)
 
     companies = await get_results(db_pool, str(order_id))
     if not companies:
@@ -171,7 +186,7 @@ async def export_json(order_id: UUID, request: Request) -> Response:
         JSON file download response.
     """
     db_pool = _get_db_pool(request)
-    await _get_verified_order(db_pool, str(order_id), require_paid=True)
+    await _get_verified_order(db_pool, str(order_id), require_paid=True, request=request)
 
     companies = await get_results(db_pool, str(order_id))
     if not companies:

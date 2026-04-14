@@ -188,6 +188,71 @@ async def create_admin_order(
     }
 
 
+# ── POST /api/v1/orders/demo ─────────────────────────────────────────────────
+
+@router.post(
+    "/demo",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Demo order — 20 full unblurred leads for jares-ai.com visitors",
+)
+async def create_demo_order(
+    payload: OrderCreate,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    config: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    """
+    Create a demo lead generation order for jares-ai.com domain visitors.
+
+    Requires X-Demo-Secret header matching DEMO_SECRET env var.
+    Returns 20 full unblurred leads — same quality as admin, separate secret.
+    Allows JSON download. Does NOT expose the admin dashboard.
+
+    Args:
+        payload: Order creation payload.
+        background_tasks: FastAPI background task queue.
+        request: HTTP request.
+        config: Application settings.
+
+    Returns:
+        Dict with order_id, status, and poll_url.
+
+    Raises:
+        HTTPException 403: If demo secret is missing or invalid.
+    """
+    demo_secret = request.headers.get("X-Demo-Secret", "")
+    if not config.DEMO_SECRET or demo_secret != config.DEMO_SECRET:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid or missing demo secret.",
+        )
+
+    db_pool = _get_db_pool(request)
+
+    order_dict = payload.model_dump()
+    order_dict["is_trial"] = False
+    order_dict["count_target"] = 20  # Demo: up to 20 strictly validated leads
+
+    order_id = await create_order(db_pool, order_dict)
+    logger.info(f"[ORDERS][create_demo_order] Demo order created: {order_id}")
+
+    background_tasks.add_task(
+        _launch_pipeline,
+        str(order_id),
+        order_dict,
+        db_pool,
+        config,
+        False,  # is_trial=False → full unblurred results
+    )
+
+    return {
+        "order_id": str(order_id),
+        "status": "running",
+        "message": "Demo order started. 20 full unblurred leads incoming.",
+        "poll_url": f"/api/v1/orders/{order_id}",
+    }
+
+
 # ── POST /api/v1/orders ───────────────────────────────────────────────────────
 
 class PaidOrderCreate(OrderCreate):

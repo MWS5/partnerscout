@@ -76,6 +76,14 @@ class Settings(BaseSettings):
         default=None,
         description="Secret token for owner admin access. Bypasses trial limits and Stripe.",
     )
+    DEMO_SECRET: Optional[str] = Field(
+        default=None,
+        description=(
+            "Demo secret for jares-ai.com domain visitors. "
+            "Grants full unblurred 20-lead access + JSON download. "
+            "Embedded in frontend JS — separate from ADMIN_SECRET (no admin dashboard access)."
+        ),
+    )
 
     # ── Payments ──────────────────────────────────────────────────────────────
     STRIPE_SECRET_KEY: Optional[str] = Field(
