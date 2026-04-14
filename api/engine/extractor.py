@@ -18,6 +18,7 @@ Optional API keys (configure via env vars):
 """
 
 import asyncio
+import html as _html_module
 import json
 import re
 import time
@@ -43,6 +44,7 @@ CONTACT_QUERY_TEMPLATES = [
     '"{name}" +33 OR +377 OR +34 OR +39 OR +44',     # European phone codes
     '"{name}" site officiel contact adresse',
     '"{name}" reservations@ OR contact@ OR info@',    # direct email pattern search
+    '"{name}" "@" email réservation nous-contacter',  # French email search
 ]
 
 
@@ -102,6 +104,13 @@ _PHONE_RE = re.compile(
 
 _EMAIL_RE = re.compile(
     r'\b([a-zA-Z0-9._%+\-]{2,50}@[a-zA-Z0-9.\-]{2,40}\.[a-zA-Z]{2,8})\b'
+)
+
+# Catches obfuscated emails in mailto: href attributes
+# e.g. <a href="mailto:info@hotel.com"> or encoded variants
+_MAILTO_RE = re.compile(
+    r'mailto:([a-zA-Z0-9._%+\-]{2,50}@[a-zA-Z0-9.\-]{2,40}\.[a-zA-Z]{2,8})',
+    re.IGNORECASE,
 )
 
 _EMAIL_BLACKLIST = frozenset({
@@ -425,6 +434,32 @@ async def _fetch_emails_direct(
 
     found_emails: list[str] = []
 
+    def _domain_match(email_addr: str) -> bool:
+        """Return True if email belongs to company_domain."""
+        domain = email_addr.lower().split("@")[-1]
+        return (
+            domain == company_domain
+            or domain.endswith("." + company_domain)
+            or company_domain.endswith("." + domain)
+        )
+
+    def _extract_from_text(text: str) -> list[str]:
+        """Extract domain-matched emails from raw or decoded text."""
+        results = []
+        # 1. HTML entity decode — catches &#x72;&#x65;&#x73;... obfuscation
+        decoded = _html_module.unescape(text)
+        # 2. mailto: hrefs — most reliable signal (explicit intent to email)
+        for m in _MAILTO_RE.findall(decoded):
+            if _domain_match(m) and m.lower() not in [e.lower() for e in results]:
+                results.append(m.lower())
+        # 3. Plain text email regex on decoded HTML
+        for m in _EMAIL_RE.findall(decoded):
+            if _domain_match(m) and m.lower() not in [e.lower() for e in results]:
+                results.append(m.lower())
+        return results
+
+    # ── Pass 1: Direct HTTP fetch (fast, full HTML) ───────────────────────────
+    direct_success_count = 0
     try:
         async with httpx.AsyncClient(
             timeout=8.0,
@@ -439,22 +474,39 @@ async def _fetch_emails_direct(
                 continue
             if not hasattr(resp, "status_code") or resp.status_code != 200:
                 continue
-
-            html = resp.text
-            for email in _EMAIL_RE.findall(html):
-                email_lower = email.lower()
-                domain = email_lower.split("@")[-1]
-                # Only accept emails that match the company's own domain
-                if (
-                    domain == company_domain
-                    or domain.endswith("." + company_domain)
-                    or company_domain.endswith("." + domain)
-                ):
-                    if email_lower not in [e.lower() for e in found_emails]:
-                        found_emails.append(email)
+            direct_success_count += 1
+            for email in _extract_from_text(resp.text):
+                if email not in found_emails:
+                    found_emails.append(email)
 
     except Exception as e:
-        logger.warning(f"[EXTRACTOR][_fetch_emails_direct] Error for {base_url}: {e}")
+        logger.warning(f"[EXTRACTOR][_fetch_emails_direct] Direct fetch error for {base_url}: {e}")
+
+    # ── Pass 2: Jina Reader fallback (bypasses bot-protection, CDN IPs) ───────
+    # Triggered when direct fetch found no pages (bot protection on Railway IPs)
+    # Jina reads through its own infrastructure so hotel websites can't block it.
+    if not found_emails and direct_success_count < 3:
+        logger.info(
+            f"[EXTRACTOR][_fetch_emails_direct] Direct fetch blocked for '{company_domain}' "
+            f"— trying Jina fallback for contact pages"
+        )
+        jina_contact_pages = [
+            f"{base_url.rstrip('/')}/contact",
+            f"{base_url.rstrip('/')}/nous-contacter",
+            f"{base_url.rstrip('/')}/fr/contact",
+            f"{base_url.rstrip('/')}/en/contact",
+        ]
+        jina_results = await asyncio.gather(
+            *[jina_read(url, max_chars=4000) for url in jina_contact_pages],
+            return_exceptions=True,
+        )
+        for content in jina_results:
+            if isinstance(content, str) and content:
+                for email in _extract_from_text(content):
+                    if email not in found_emails:
+                        found_emails.append(email)
+
+    if not found_emails:
         return []
 
     if not found_emails:
