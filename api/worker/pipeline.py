@@ -413,7 +413,7 @@ async def run_pipeline(
     # Optional premium API keys (graceful degradation if not set)
     google_places_key = getattr(config, "GOOGLE_PLACES_API_KEY", "") or ""
     hunter_api_key    = getattr(config, "HUNTER_API_KEY", "") or ""
-    serper_api_key    = getattr(config, "SERPER_API_KEY", "") or ""
+    tavily_api_key    = getattr(config, "TAVILY_API_KEY", "") or ""
 
     try:
         # ── Step 1: Mark as running ───────────────────────────────────────────
@@ -539,7 +539,7 @@ async def run_pipeline(
             max_concurrent=5,
             google_places_key=google_places_key,
             hunter_api_key=hunter_api_key,
-            serper_api_key=serper_api_key,
+            tavily_api_key=tavily_api_key,
             db_pool=db_pool,   # for cost logging to jarvis_search_usage
         )
         await update_order_status(db_pool, order_id, "running", PROGRESS_EXTRACT)

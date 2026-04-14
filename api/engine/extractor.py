@@ -389,41 +389,41 @@ _PREFERRED_EMAIL_PREFIXES: tuple[str, ...] = (
 )
 
 
-async def _serper_email_search(
+async def _tavily_email_search(
     company_domain: str,
     company_name: str,
-    serper_api_key: str,
+    tavily_api_key: str,
 ) -> list[str]:
     """
-    Search Google via Serper for domain-specific emails.
+    Search via Tavily AI for domain-specific emails — last-resort fallback.
 
-    Most reliable fallback: Google has indexed hotel contact pages.
-    Query: "@domain.com" returns pages/snippets containing the email.
+    Used ONLY when Direct HTTP (Pass 1) + Jina Reader (Pass 2) both fail.
+    Tavily free tier: 1000 searches/month. Works from Railway cloud IPs.
 
     Args:
         company_domain: e.g. "royal-riviera.com"
         company_name: e.g. "Hotel Royal-Riviera"
-        serper_api_key: Serper.dev API key.
+        tavily_api_key: Tavily API key (TAVILY_API_KEY env var).
 
     Returns:
-        List of domain-matched emails found in Google search snippets.
+        List of domain-matched emails found in search snippets.
     """
-    if not serper_api_key or not company_domain:
+    if not tavily_api_key or not company_domain:
         return []
 
     # Two-query approach: domain-email pattern + site-specific contact
     queries = [
-        f'"@{company_domain}"',                    # direct: "@royal-riviera.com"
-        f'site:{company_domain} email contact',    # site-search for contact page
+        f'"@{company_domain}"',                    # exact: "@royal-riviera.com"
+        f'site:{company_domain} contact email',    # site-search contact page
     ]
     found: list[str] = []
 
     try:
-        from api.engine.searcher import serper_search
+        from api.engine.searcher import tavily_search
         for query in queries:
-            results = await serper_search(query, serper_api_key, num=5)
+            results = await tavily_search(query, tavily_api_key, num=5)
             for r in results:
-                text = r.get("snippet", "") + " " + r.get("title", "")
+                text = r.get("snippet", "") + " " + r.get("title", "") + " " + r.get("content", "")
                 for email in _EMAIL_RE.findall(text):
                     email_l = email.lower()
                     if email_l.endswith("@" + company_domain) and email_l not in found:
@@ -434,12 +434,12 @@ async def _serper_email_search(
                         found.append(email_l)
             if found:
                 logger.info(
-                    f"[EXTRACTOR][_serper_email_search] '{company_domain}' found: {found[:3]}"
+                    f"[EXTRACTOR][_tavily_email_search] '{company_domain}' found: {found[:3]}"
                 )
                 break
 
     except Exception as e:
-        logger.warning(f"[EXTRACTOR][_serper_email_search] Error for '{company_domain}': {e}")
+        logger.warning(f"[EXTRACTOR][_tavily_email_search] Error for '{company_domain}': {e}")
 
     return found
 
@@ -448,7 +448,7 @@ async def _fetch_emails_direct(
     base_url: str,
     company_domain: str,
     company_name: str = "",
-    serper_api_key: str = "",
+    tavily_api_key: str = "",
 ) -> list[str]:
     """
     Tier 2.5: Directly fetch contact pages and extract domain-matched emails.
@@ -577,19 +577,16 @@ async def _fetch_emails_direct(
                 logger.debug(f"[EXTRACTOR][_fetch_emails_direct] Jina error for {jina_url}: {e}")
                 continue
 
-    if not found_emails:
-        return []
-
-    # ── Pass 3: Serper Google Search (final fallback) ─────────────────────────
-    # Used when direct fetch + Jina both fail (Jina rate-limited or blocked).
-    # Google has indexed hotel contact pages — "@domain.com" search is reliable.
-    if not found_emails and serper_api_key:
+    # ── Pass 3: Tavily Search (last resort) ──────────────────────────────────
+    # Used ONLY when Direct HTTP + Jina both fail (bot-blocked or rate-limited).
+    # Tavily free tier: 1000/month — spend wisely (luxury hotels only need it).
+    if not found_emails and tavily_api_key:
         logger.info(
-            f"[EXTRACTOR][_fetch_emails_direct] Jina also returned no emails for "
-            f"'{company_domain}' — trying Serper Google fallback"
+            f"[EXTRACTOR][_fetch_emails_direct] Passes 1+2 failed for "
+            f"'{company_domain}' — trying Tavily last-resort fallback"
         )
-        serper_emails = await _serper_email_search(company_domain, company_name, serper_api_key)
-        found_emails.extend(e for e in serper_emails if e not in found_emails)
+        tavily_emails = await _tavily_email_search(company_domain, company_name, tavily_api_key)
+        found_emails.extend(e for e in tavily_emails if e not in found_emails)
 
     if not found_emails:
         return []
@@ -725,7 +722,7 @@ async def extract_company_data(
     snippet: str = "",
     google_places_key: str = "",
     hunter_api_key: str = "",
-    serper_api_key: str = "",
+    tavily_api_key: str = "",
     db_pool: Any = None,
 ) -> dict[str, Any]:
     """
@@ -780,7 +777,7 @@ async def extract_company_data(
         _hunter_email_search(domain, hunter_api_key),
         _fetch_website(url),
         _search_contacts(company_name),
-        _fetch_emails_direct(url, domain, company_name, serper_api_key),  # Tier 2.5
+        _fetch_emails_direct(url, domain, company_name, tavily_api_key),  # Tier 2.5 + Pass 3
         return_exceptions=False,
     )
 
@@ -975,7 +972,7 @@ async def extract_batch(
     max_concurrent: int = 3,
     google_places_key: str = "",
     hunter_api_key: str = "",
-    serper_api_key: str = "",
+    tavily_api_key: str = "",
     db_pool: Any = None,
 ) -> list[dict[str, Any]]:
     """
@@ -1010,7 +1007,7 @@ async def extract_batch(
                     snippet=company.get("snippet", ""),
                     google_places_key=google_places_key,
                     hunter_api_key=hunter_api_key,
-                    serper_api_key=serper_api_key,
+                    tavily_api_key=tavily_api_key,
                     db_pool=db_pool,
                 ),
             }
