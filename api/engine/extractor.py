@@ -359,17 +359,139 @@ async def _hunter_email_search(
         return ("", ms, False)
 
 
-# ── Tier 3: Official Website (multi-page) ─────────────────────────────────────
+# ── Tier 2.5: Direct HTML Email Extraction ───────────────────────────────────
+# Most reliable for French luxury hotels — contacts are in HTML, never JS-dynamic.
+# Domain-matched only: reservations@royal-riviera.com, info@lenegresco.com, etc.
+
+_DIRECT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+}
+
+_PREFERRED_EMAIL_PREFIXES: tuple[str, ...] = (
+    "reservations", "reservation", "contact", "info",
+    "sales", "events", "concierge", "groups", "spa",
+    "booking", "mice", "wedding", "reception",
+)
+
+
+async def _fetch_emails_direct(
+    base_url: str,
+    company_domain: str,
+) -> list[str]:
+    """
+    Tier 2.5: Directly fetch contact pages and extract domain-matched emails.
+
+    More reliable than Jina for French hotel contact pages because:
+    - No char limit — scans the full raw HTML
+    - Tries French URL variants (/nous-contacter, /contactez-nous)
+    - Domain-matching filter: only returns hotel's own email (@domain.com)
+    - Zero LLM cost
+
+    Args:
+        base_url: Official company website URL.
+        company_domain: Root domain (e.g. "royal-riviera.com").
+
+    Returns:
+        Prioritized list of domain-matched emails (preferred prefixes first).
+    """
+    if not base_url or not company_domain:
+        return []
+
+    base = base_url.rstrip("/")
+
+    # Comprehensive contact page list — EN + FR (covers 95%+ of French luxury hotels)
+    contact_pages = [
+        base_url,
+        f"{base}/contact",
+        f"{base}/nous-contacter",          # French — most common
+        f"{base}/contactez-nous",          # French alternative
+        f"{base}/contact-us",
+        f"{base}/fr/contact",
+        f"{base}/fr/nous-contacter",
+        f"{base}/en/contact",
+        f"{base}/en/contact-us",
+        f"{base}/contacts",
+        f"{base}/contact.html",
+        f"{base}/contact.php",
+        f"{base}/about",
+        f"{base}/about-us",
+    ]
+
+    found_emails: list[str] = []
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=8.0,
+            follow_redirects=True,
+            headers=_DIRECT_HEADERS,
+        ) as client:
+            tasks = [client.get(url) for url in contact_pages]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for url, resp in zip(contact_pages, responses):
+            if isinstance(resp, Exception):
+                continue
+            if not hasattr(resp, "status_code") or resp.status_code != 200:
+                continue
+
+            html = resp.text
+            for email in _EMAIL_RE.findall(html):
+                email_lower = email.lower()
+                domain = email_lower.split("@")[-1]
+                # Only accept emails that match the company's own domain
+                if (
+                    domain == company_domain
+                    or domain.endswith("." + company_domain)
+                    or company_domain.endswith("." + domain)
+                ):
+                    if email_lower not in [e.lower() for e in found_emails]:
+                        found_emails.append(email)
+
+    except Exception as e:
+        logger.warning(f"[EXTRACTOR][_fetch_emails_direct] Error for {base_url}: {e}")
+        return []
+
+    if not found_emails:
+        return []
+
+    # Sort: preferred prefixes first, then alphabetical
+    def _email_priority(e: str) -> int:
+        local = e.lower().split("@")[0]
+        for i, prefix in enumerate(_PREFERRED_EMAIL_PREFIXES):
+            if local.startswith(prefix):
+                return i
+        return len(_PREFERRED_EMAIL_PREFIXES)
+
+    found_emails.sort(key=_email_priority)
+    found_emails = list(dict.fromkeys([e.lower() for e in found_emails]))  # dedup
+
+    logger.info(
+        f"[EXTRACTOR][_fetch_emails_direct] '{company_domain}' → "
+        f"{len(found_emails)} domain-matched emails: {found_emails[:3]}"
+    )
+    return found_emails
+
+
+# ── Tier 3: Official Website (multi-page via Jina) ────────────────────────────
 
 async def _fetch_website(base_url: str) -> str:
     """
-    Fetch official website: homepage + contact/about pages in parallel.
+    Fetch official website via Jina: homepage + contact/about pages.
+
+    Expanded with French URL variants (covers /nous-contacter, /contactez-nous).
+    Increased max_chars to 2500 per page so emails deeper in content are captured.
 
     Args:
         base_url: Company official URL.
 
     Returns:
-        Combined text from all accessible pages (max ~6000 chars).
+        Combined text from all accessible pages (max ~9000 chars).
     """
     if not base_url:
         return ""
@@ -378,29 +500,32 @@ async def _fetch_website(base_url: str) -> str:
     pages = [
         base_url,
         f"{base}/contact",
+        f"{base}/nous-contacter",     # French — most common for Côte d'Azur hotels
+        f"{base}/contactez-nous",     # French alternative
         f"{base}/contact-us",
-        f"{base}/about",
         f"{base}/contacts",
+        f"{base}/about",
         f"{base}/en/contact",
         f"{base}/fr/contact",
+        f"{base}/fr/nous-contacter",  # French with lang prefix
         f"{base}/en/contact-us",
     ]
 
     results = await asyncio.gather(
-        *[jina_read(url, max_chars=1500) for url in pages],
+        *[jina_read(url, max_chars=2500) for url in pages],
         return_exceptions=True,
     )
 
     parts = []
     for url, content in zip(pages, results):
-        if isinstance(content, str) and content.strip():
+        if isinstance(content, str) and content.strip() and len(content.strip()) > 30:
             parts.append(f"[{url}]\n{content.strip()}")
 
     combined = "\n\n".join(parts)
     logger.debug(
-        f"[EXTRACTOR][_fetch_website] {len(parts)}/{len(pages)} pages fetched for {base_url}"
+        f"[EXTRACTOR][_fetch_website] {len(parts)}/{len(pages)} pages via Jina for {base_url}"
     )
-    return combined[:6000]
+    return combined[:9000]
 
 
 # ── Tier 4: DDG Contact Search (Knowledge Panel) ──────────────────────────────
@@ -514,12 +639,14 @@ async def extract_company_data(
         hunter_result,
         website_content,
         search_snippets,
+        direct_emails,
     ) = await asyncio.gather(
         extract_schema_contacts(url, company_name),
         _google_places_contact(company_name, google_places_key),
         _hunter_email_search(domain, hunter_api_key),
         _fetch_website(url),
         _search_contacts(company_name),
+        _fetch_emails_direct(url, domain),  # Tier 2.5: direct HTML scan
         return_exceptions=False,
     )
 
@@ -527,6 +654,8 @@ async def extract_company_data(
     hunter_email, hunter_ms, hunter_success = (
         hunter_result if isinstance(hunter_result, tuple) else ("", 0, False)
     )
+    # Best direct email (domain-matched, preferred prefix)
+    direct_email = direct_emails[0] if isinstance(direct_emails, list) and direct_emails else ""
 
     # ── Schema Tier 0: Check if we have enough from structured data ───────────
     schema_phone   = schema_data.get("phone", "")   if schema_data else ""
@@ -537,7 +666,7 @@ async def extract_company_data(
     # Short-circuit: if schema has phone + email + address → skip LLM entirely
     # Use Places phone/email as supplement if schema is partial
     effective_phone   = schema_phone   or (places_data.get("phone", "")   if places_data else "")
-    effective_email   = schema_email   or hunter_email
+    effective_email   = schema_email   or hunter_email or direct_email
     effective_address = schema_address or (places_data.get("address", "") if places_data else "")
 
     if effective_phone and effective_email and effective_address:
@@ -582,7 +711,8 @@ async def extract_company_data(
         if places_data else ""
     )
     hunter_text = f"Email: {hunter_email}" if hunter_email else ""
-    all_text = f"{snippet}\n{schema_text}\n{places_text}\n{hunter_text}\n{website_content}\n{search_snippets}"
+    direct_text = f"Email (direct HTML scan): {direct_email}" if direct_email else ""
+    all_text = f"{snippet}\n{schema_text}\n{places_text}\n{hunter_text}\n{direct_text}\n{website_content}\n{search_snippets}"
 
     # ── Tier 5: Regex fast-path ───────────────────────────────────────────────
     regex_emails = _extract_emails(all_text)
@@ -592,6 +722,7 @@ async def extract_company_data(
         f"[EXTRACTOR] '{company_name}' pre-LLM: "
         f"places={'✓' if places_data.get('phone') else '✗'} "
         f"hunter={'✓' if hunter_email else '✗'} "
+        f"direct_email={'✓ ' + direct_email if direct_email else '✗'} "
         f"regex_emails={regex_emails[:2]} "
         f"regex_phones={regex_phones[:2]}"
     )
@@ -606,6 +737,10 @@ async def extract_company_data(
     hunter_formatted = (
         f"Email found: {hunter_email}"
         if hunter_email else "(Hunter.io not configured or no email found for this domain)"
+    )
+    direct_formatted = (
+        f"Domain-matched emails found via direct HTML scan: {', '.join(direct_emails[:5])}"
+        if direct_emails else "(No domain-matched emails found in contact pages HTML)"
     )
 
     # ── LLM extraction ────────────────────────────────────────────────────────
@@ -622,6 +757,8 @@ async def extract_company_data(
     full_prompt = (
         f"=== TIER 0 — SCHEMA.ORG STRUCTURED DATA (self-reported by business) ===\n"
         f"{schema_formatted}\n\n"
+        f"=== TIER 2.5 — DIRECT HTML CONTACT PAGE SCAN (domain-matched emails only) ===\n"
+        f"{direct_formatted}\n\n"
         + EXTRACTION_PROMPT.format(
             company_name=company_name,
             url=url or "unknown",
@@ -663,6 +800,15 @@ async def extract_company_data(
     if hunter_email and extracted["email"] == "Not found":
         extracted["email"] = hunter_email
         logger.info(f"[EXTRACTOR] Hunter.io injected email for '{company_name}': {hunter_email}")
+
+    # ── Safety net: inject Tier 2.5 (direct HTML scan — domain-matched) ───────
+    # This is highly reliable: reservations@, contact@, info@ directly from HTML.
+    # Injected BEFORE regex (which might pick up unrelated emails from snippets).
+    if direct_email and extracted["email"] == "Not found":
+        extracted["email"] = direct_email
+        logger.info(
+            f"[EXTRACTOR] Direct HTML injected email for '{company_name}': {direct_email}"
+        )
 
     # ── Safety net: inject regex results ──────────────────────────────────────
     if extracted["email"] == "Not found" and regex_emails:
