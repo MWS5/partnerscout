@@ -499,23 +499,26 @@ async def _fetch_emails_direct(
             f"{base_url.rstrip('/')}/en/contact",
             f"{base_url.rstrip('/')}/en/contact-us",
         ]
-        # max_chars=15000: Royal-Riviera contact email is at char 8324 in Jina output —
-        # previous limit of 4000 was cutting off before reaching the actual contact section.
-        jina_results = await asyncio.gather(
-            *[jina_read(url, max_chars=15000) for url in jina_contact_pages],
-            return_exceptions=True,
-        )
-        for content in jina_results:
-            if isinstance(content, str) and content:
-                for email in _extract_from_text(content):
-                    if email not in found_emails:
-                        found_emails.append(email)
-
-        if found_emails:
-            logger.info(
-                f"[EXTRACTOR][_fetch_emails_direct] Jina fallback found {len(found_emails)} "
-                f"emails for '{company_domain}': {found_emails[:3]}"
-            )
+        # Sequential Jina reads — stops at first success to avoid Jina rate limiting.
+        # Royal-Riviera: email at char 8324, need max_chars=15000.
+        # Run ONE at a time: avoids 51 concurrent Jina calls when processing 3 companies
+        # simultaneously (17 Jina reads per company × 3 concurrency = rate limit exceeded).
+        for jina_url in jina_contact_pages:
+            try:
+                content = await jina_read(jina_url, max_chars=15000)
+                if isinstance(content, str) and content:
+                    for email in _extract_from_text(content):
+                        if email not in found_emails:
+                            found_emails.append(email)
+                if found_emails:
+                    logger.info(
+                        f"[EXTRACTOR][_fetch_emails_direct] Jina found {len(found_emails)} "
+                        f"emails at '{jina_url}': {found_emails[:3]}"
+                    )
+                    break  # Stop at first successful page — avoid unnecessary Jina calls
+            except Exception as e:
+                logger.debug(f"[EXTRACTOR][_fetch_emails_direct] Jina error for {jina_url}: {e}")
+                continue
 
     if not found_emails:
         return []
@@ -560,23 +563,19 @@ async def _fetch_website(base_url: str) -> str:
         return ""
 
     base = base_url.rstrip("/")
+    # Reduced page list for _fetch_website — this is for luxury SCORING content only.
+    # Email extraction is handled by _fetch_emails_direct (more thorough).
+    # Fewer Jina reads here = less rate limit pressure.
     pages = [
         base_url,
         f"{base}/contact",
         f"{base}/nous-contacter",     # French — most common for Côte d'Azur hotels
-        f"{base}/contactez-nous",     # French alternative
-        f"{base}/contact-us",
-        f"{base}/contacts",
         f"{base}/about",
         f"{base}/en/contact",
         f"{base}/fr/contact",
-        f"{base}/fr/nous-contacter",  # French with lang prefix
-        f"{base}/en/contact-us",
     ]
 
-    # max_chars=6000 for Jina pages: luxury hotel contact sections start after
-    # ~8000 chars of navigation. Using 6000 here as a balanced compromise
-    # (full email extraction handled by _fetch_emails_direct with 15000 limit).
+    # max_chars=6000: enough for luxury scoring content
     results = await asyncio.gather(
         *[jina_read(url, max_chars=6000) for url in pages],
         return_exceptions=True,
