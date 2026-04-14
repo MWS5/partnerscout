@@ -499,8 +499,10 @@ async def _fetch_emails_direct(
             f"{base_url.rstrip('/')}/en/contact",
             f"{base_url.rstrip('/')}/en/contact-us",
         ]
+        # max_chars=15000: Royal-Riviera contact email is at char 8324 in Jina output —
+        # previous limit of 4000 was cutting off before reaching the actual contact section.
         jina_results = await asyncio.gather(
-            *[jina_read(url, max_chars=4000) for url in jina_contact_pages],
+            *[jina_read(url, max_chars=15000) for url in jina_contact_pages],
             return_exceptions=True,
         )
         for content in jina_results:
@@ -572,8 +574,11 @@ async def _fetch_website(base_url: str) -> str:
         f"{base}/en/contact-us",
     ]
 
+    # max_chars=6000 for Jina pages: luxury hotel contact sections start after
+    # ~8000 chars of navigation. Using 6000 here as a balanced compromise
+    # (full email extraction handled by _fetch_emails_direct with 15000 limit).
     results = await asyncio.gather(
-        *[jina_read(url, max_chars=2500) for url in pages],
+        *[jina_read(url, max_chars=6000) for url in pages],
         return_exceptions=True,
     )
 
