@@ -97,7 +97,7 @@ curl https://partnerscout-api-production.up.railway.app/api/v1/export/UUID/csv \
 
 ```bash
 cd C:\Users\mwebs\Downloads\ai_business\workspaces\partnerscout
-RAILWAY_TOKEN="58c4882d-c36d-406a-ace4-bc587307b88d" railway up --service "1293d163-605f-40d6-8a1b-a0672b7282d2" --detach
+RAILWAY_TOKEN="$RAILWAY_TOKEN"  # set via shell env (NEVER commit token here) railway up --service "1293d163-605f-40d6-8a1b-a0672b7282d2" --detach
 ```
 
 ---
@@ -143,7 +143,7 @@ SELECT status, COUNT(*) FROM ps_orders GROUP BY status;
 ## 🔍 Логи Railway
 
 ```bash
-RAILWAY_TOKEN="58c4882d-c36d-406a-ace4-bc587307b88d" railway logs --service "1293d163-605f-40d6-8a1b-a0672b7282d2"
+RAILWAY_TOKEN="$RAILWAY_TOKEN"  # set via shell env (NEVER commit token here) railway logs --service "1293d163-605f-40d6-8a1b-a0672b7282d2"
 ```
 
 Или в браузере: https://railway.app/project/7e7ebe3b-913a-4790-9989-b7320318fb29
