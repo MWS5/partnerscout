@@ -219,11 +219,10 @@ async def _run_search_batch(
     all_results: list[dict[str, Any]] = []
 
     # Log which sources are active (helps diagnose 0-result issues)
+    # Serper.dev killed 2026-05-14 — credits exhausted, account dead.
     active_sources = []
     if config.TAVILY_API_KEY:
         active_sources.append("tavily")
-    if config.SERPER_API_KEY:
-        active_sources.append("serper")
     if config.BRAVE_API_KEY:
         active_sources.append("brave")
     active_sources.append("ddg")
@@ -245,10 +244,9 @@ async def _run_search_batch(
                 tasks.append(tavily_search(q_with_excl, config.TAVILY_API_KEY, num=5))
                 task_niches.append(niche)
 
-            # SECONDARY: Serper.dev — Google results, works from Railway IPs
-            if config.SERPER_API_KEY:
-                tasks.append(serper_search(q_with_excl, config.SERPER_API_KEY, num=5))
-                task_niches.append(niche)
+            # SECONDARY: Serper.dev — KILLED 2026-05-14 (credits exhausted)
+            # serper_search import kept for future re-enable. Do not re-introduce
+            # without refilling credits at serper.dev/billing.
 
             # TERTIARY: Brave Search — free quota, good quality
             if config.BRAVE_API_KEY:
